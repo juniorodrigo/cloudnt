@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "cloudnt",
+      "runtimeExecutable": "/home/juniorrodrigo/.bun/bin/bun",
+      "runtimeArgs": ["run", "scripts/dev.ts"],
+      "port": 5173
+    }
+  ]
+}
