@@ -32,8 +32,11 @@ const fail = (status: number, error: string) => json({ error }, status);
 
 function clientIp(req: Request, server: { requestIP(r: Request): { address: string } | null }): string {
   if (TRUST_PROXY) {
+    // The *last* entry, not the first: proxies append, so a client that sends
+    // its own x-forwarded-for gets it kept and the real address added after it.
+    // Reading the head would hand every per-IP quota a value the caller picks.
     const forwarded = req.headers.get("x-forwarded-for");
-    if (forwarded) return forwarded.split(",")[0]!.trim();
+    if (forwarded) return forwarded.split(",").pop()!.trim();
   }
   return server.requestIP(req)?.address ?? "unknown";
 }
@@ -196,9 +199,14 @@ async function serveStatic(pathname: string): Promise<Response> {
       headers: { "cache-control": pathname.includes("/assets/") ? "public, max-age=31536000, immutable" : "no-cache" },
     });
   }
-  return new Response(Bun.file(DIST + "index.html"), {
-    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" },
-  });
+  // Every unknown path gets the same HTML, so the landing's indexable metadata
+  // would otherwise travel with each room URL. The header overrides it.
+  const headers: Record<string, string> = {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-cache",
+  };
+  if (pathname !== "/") headers["x-robots-tag"] = "noindex, nofollow";
+  return new Response(Bun.file(DIST + "index.html"), { headers });
 }
 
 function securityHeaders(res: Response): Response {
@@ -397,6 +405,14 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
       if (result.ok) return json({ rev: result.rev });
       if (result.reason === "too_large") return fail(413, "el texto supera el límite de la sala");
       return json({ error: "conflict", text: result.text, rev: result.rev }, 409);
+    }
+
+    case "/api/pin":
+      return rooms.pinText(room) ? json({ ok: true }) : fail(409, "no hay nada nuevo que fijar");
+
+    case "/api/entry/remove": {
+      if (typeof body.id !== "number") return fail(400, "petición inválida");
+      return rooms.removeEntry(room, body.id) ? json({ ok: true }) : fail(404, "no encontrada");
     }
 
     case "/api/clear":

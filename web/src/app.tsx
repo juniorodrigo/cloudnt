@@ -6,8 +6,10 @@ import { Waiting } from "./Waiting.tsx";
 import { Room } from "./Room.tsx";
 import { connect } from "./transport.ts";
 import { forget, remember, tokenFor } from "./store.ts";
+import { Logo } from "./Logo.tsx";
 
 const CODE_RE = new RegExp(`^[${CODE_ALPHABET}]{${CODE_LENGTH}}$`);
+const LANDING_TITLE = "cloudnt · portapapeles compartido entre máquinas";
 
 type View =
   | { k: "home"; error?: string }
@@ -85,6 +87,11 @@ export function App() {
     return () => removeEventListener("popstate", route);
   }, [enter]);
 
+  useEffect(() => {
+    const code = view.k === "waiting" ? view.code : codeFromPath();
+    document.title = code ? `${code} · cloudnt` : LANDING_TITLE;
+  }, [view]);
+
   // Waiting room channel: only reaches the visitor themselves.
   useEffect(() => {
     if (view.k !== "waiting") return;
@@ -106,7 +113,7 @@ export function App() {
     case "opening":
       return (
         <div class="center-note">
-          <span class="wordmark">cloudnt</span>
+          <Logo />
           <p style="color: var(--ink-muted)">Un momento...</p>
         </div>
       );

@@ -288,7 +288,7 @@ confianza del producto y ningún competidor lo muestra:
 
 - Sincronización bidireccional por WebSocket, último-que-escribe-gana
 - **Detección de conflicto**: si ambos lados editan a la vez no se pisa el texto local; aviso con "traer la nueva" / "conservar la mía"
-- **Historial**: los últimos 10 pegados de la sala, restaurables con un clic. Convierte la app de buffer a portapapeles con memoria; es la función que hace que la gente vuelva
+- **Pegadas**: las últimas 10 de la sala, restaurables con un clic. Se guardan solas cuando un pegado reemplaza al anterior, y a mano con "fijar" para tener dos textos a la vez sin pisar ninguno. No se duplica lo que ya está en la lista. Convierte la app de buffer a portapapeles con memoria; es la función que hace que la gente vuelva
 - **Resaltado de sintaxis** en modo lectura, con detección de lenguaje
 - **Descargar como archivo**: para bloques grandes suele ser mejor que copiar
 - **Pegado directo al crear sala**: si hay permiso de portapapeles, un botón único de "pegar lo que tengo copiado"
@@ -321,12 +321,24 @@ cli/
 Socket.io ni broker. El servidor son ~200 líneas.
 
 **Preact, no React.** El cliente crítico corre en un navegador dentro de una VM
-con red pésima. Preact + Vite deja el bundle en ~15 KB comprimidos frente a
-~45 KB de React. En alta latencia se nota al cargar.
+con red pésima, donde cada kilobyte de más es otro round-trip sobre un enlace
+que pierde paquetes. Preact + Vite ahorra unos 30 KB comprimidos frente a React,
+y esa diferencia se nota al cargar.
+
+**Presupuesto de carga: 30 KB brotli en total**, sumando HTML, JS y CSS de la
+primera carga. Es un techo, no una meta: hoy la app va por ~18 KB. La cifra que
+importa es lo que viaja por el cable en la primera visita, no el tamaño de un
+chunk suelto ni el de una dependencia concreta, así que gastar el margen en CSS
+de diseño o en una pantalla más está bien mientras el total no se acerque al
+techo. Lo caro no es el peso, es el número de viajes: la app debe seguir
+cargando en una sola tanda de peticiones, sin fuentes ni chunks diferidos en el
+camino crítico. Cuando el techo estorbe de verdad, se sube aquí y se justifica;
+lo que no se hace es superarlo en silencio.
 
 **Cero CDNs y cero fuentes externas.** Todo inline, stack de fuentes del
 sistema. Si la VM no tiene salida a internet pero sí alcanza al servidor, la app
-debe cargar igual. Es regla de build, no buena intención.
+debe cargar igual. Esto sí es innegociable, y no depende del presupuesto: es
+regla de build, no buena intención.
 
 **WebSocket con respaldo a SSE.** Muchos proxies corporativos rompen el upgrade
 a WS. Si el único canal es WebSocket, la app falla justo en el entorno para el
@@ -393,16 +405,37 @@ se va directo a la sala de espera.
 **Sala de espera.** Casi vacía. La huella de dos palabras en grande y "esperando
 aprobación". Cero contenido.
 
-**Sala.** El editor ocupa casi todo. Arriba, el código y el reloj de expiración
-—o el indicador de sala fijada. Abajo, la lista de archivos con sus tres
-estados. En el lateral, solo para el dueño, la lista de dispositivos con botón
-de expulsar.
+**Sala.** El editor en vivo ocupa el centro, sin cromo propio: es el lienzo. Lo
+enmarcan una barra arriba y un pie abajo, y a la derecha una columna con dos
+pestañas: **Pegadas**, el historial de textos que se puede copiar, traer de
+vuelta al editor o quitar; y **Archivos**, la lista con sus tres estados y la
+zona de arrastre. Los archivos no van debajo del editor: comparten columna con
+las pegadas y solo ocupan sitio cuando se piden. La columna arranca en 420 px y
+se redimensiona arrastrando el separador; el ancho se recuerda por navegador.
+
+En la **barra**, a la izquierda el código —con la marca como único distintivo,
+porque aquí el código es la etiqueta, no el nombre—; en el centro las tres
+acciones del texto: copiar, nueva pegada, descargar; y a la derecha dos botones
+que abren paneles: **dispositivos**, con las solicitudes pendientes y la lista
+con botón de expulsar, y **ajustes**, con el acceso —aprobación automática,
+rotar código— y la zona de riesgo. Vaciar la sala y cerrarla piden confirmación
+en un modal.
+
+En el **pie**, lo que se consulta de reojo y nunca se pulsa: estado de conexión,
+reloj de expiración —o el indicador de sala fijada—, peso del texto, estado de
+sincronización y los atajos.
+
+Por debajo de 760 px las columnas se apilan con el editor primero, el separador
+desaparece y las acciones del texto se llevan una fila entera de la barra, con
+sus etiquetas.
 
 ### 7.2 El reloj
 
 No como cuenta regresiva agresiva, sino como dato: "se borra en 1 h 47 min sin
-actividad", con reinicio **visible** cuando alguien escribe. Que el usuario vea
-el reinicio es lo que genera confianza en el mecanismo.
+actividad". El reinicio se anota al lado —"· reiniciado"— en el mismo gris que
+el resto del pie: legible si se mira, invisible si no. Cambiar de color cada vez
+que alguien teclea convierte el mecanismo en una alarma, y lo que tiene que
+transmitir es exactamente lo contrario.
 
 En salas fijadas se sustituye por un indicador de estado y un acceso para
 desfijar.
@@ -412,6 +445,11 @@ desfijar.
 El usuario está en una VM donde el mouse va con retraso. Todo debe ser operable
 con teclado: copiar, descargar, saltar entre archivos, aprobar. Aquí la
 accesibilidad es también rendimiento.
+
+En la sala: `Alt+C` copia, `Alt+N` guarda el texto actual como pegada aparte y
+`Alt+S` lo descarga. Se anuncian en el pie, porque un atajo que no se ve no
+existe. El separador de la columna es un `separator` enfocable que se mueve con
+las flechas.
 
 ---
 
@@ -522,6 +560,13 @@ estable.
 El código va en el path (`cloudnt.org/f4k2`), no en subdominio. Con eso el
 Service Worker vive en un origen único y no se acumulan registros huérfanos por
 sala.
+
+Como consecuencia, **la portada se indexa y las salas no**. El HTML es el mismo
+para todas las rutas, así que el `noindex` no puede vivir en un `<meta>`: el
+servidor añade `X-Robots-Tag: noindex, nofollow` a todo lo que no sea `/`, y el
+`robots.txt` sólo permite la raíz. Los metadatos de la portada —título,
+descripción, canónica, Open Graph, JSON-LD— son los de una herramienta, no los
+de un pastebin: describen para qué sirve, no lo que alguien pegó.
 
 Pendiente antes de publicar el CLI: verificar que `cloudnt` esté libre en npm y
 que no haya binario homónimo en Homebrew. Si npm está tomado, `@cloudnt/cli`

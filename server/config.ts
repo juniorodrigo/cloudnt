@@ -9,6 +9,9 @@ export const HOST = Bun.env.CLOUDNT_HOST ?? "127.0.0.1";
  * Only honour x-forwarded-for where a proxy is known to set it. Reachable
  * directly, the header is attacker-controlled and every per-IP quota becomes
  * unlimited: a fresh value per request is enough to probe codes forever.
+ *
+ * Assumes exactly one proxy hop, which is what makes the last entry of the
+ * chain trustworthy. Behind two, the app is one hop further from the truth.
  */
 export const TRUST_PROXY = Bun.env.CLOUDNT_TRUST_PROXY === "1";
 

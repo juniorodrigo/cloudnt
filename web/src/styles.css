@@ -36,7 +36,11 @@
   --r-pill: 100px;
 
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  /* Ordered by preference, not by platform: the nicer faces come first so any
+     machine that has one never falls through to Consolas. */
+  --mono: "JetBrains Mono", "Cascadia Mono", "Cascadia Code", "IBM Plex Mono", "Fira Code", "Source Code Pro",
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, "Roboto Mono", "DejaVu Sans Mono", "Liberation Mono",
+    monospace;
 
   --gutter: 24px;
   --max-w: 1120px;
@@ -119,14 +123,6 @@ button {
   font-weight: 600;
 }
 
-.eyebrow {
-  display: inline-block;
-  font-size: 13px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-  color: var(--ink-muted);
-}
-
 /* ── buttons ─────────────────────────────────────────────────────────────── */
 
 .btn {
@@ -147,6 +143,10 @@ button {
 }
 .btn:active {
   transform: scale(0.97);
+}
+.btn:disabled {
+  opacity: 0.45;
+  transform: none;
 }
 
 .btn-primary {
@@ -169,18 +169,6 @@ button {
 }
 .btn-secondary:hover {
   background: var(--surface-2);
-}
-
-.btn-ghost {
-  background: transparent;
-  color: var(--ink-muted);
-  min-height: 36px;
-  padding: 8px 12px;
-  font-size: 13px;
-}
-.btn-ghost:hover {
-  background: var(--surface-1);
-  color: var(--ink);
 }
 
 .btn-danger {
@@ -243,23 +231,144 @@ button {
 }
 
 .wordmark {
-  font-size: 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  font-family: var(--sans);
+  font-size: 14px;
   font-weight: 600;
   color: var(--ink);
-  letter-spacing: -0.04em;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+}
+
+/* Sized in em so the mark follows the type wherever the lockup is reused. */
+.wordmark-mark {
+  width: 1.24em;
+  height: 1.24em;
+  flex: none;
+}
+
+.wordmark-tail {
+  color: var(--ink-muted);
 }
 
 .nav-spacer {
   flex: 1;
 }
 
-.nav-note {
+/* Sized in em so an icon always matches the type it sits next to. */
+.icon {
+  width: 1.25em;
+  height: 1.25em;
+  flex: none;
+}
+
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   font-size: 13px;
   color: var(--ink-muted);
+  text-decoration: none;
+}
+.nav-link:hover {
+  color: var(--ink);
 }
 
 .hero {
-  padding: clamp(48px, 7vw, 88px) 0 clamp(48px, 7vw, 80px);
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  padding: clamp(48px, 7vw, 96px) 0 clamp(48px, 7vw, 88px);
+}
+
+/* Drawn, not loaded: the spec forbids external assets, so the technical texture
+   is two hairline grids masked to fade out before they compete with the type. */
+.hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  background:
+    repeating-linear-gradient(to right, var(--hairline) 0 1px, transparent 1px 76px),
+    repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px 76px);
+  -webkit-mask-image: radial-gradient(ellipse 85% 70% at 55% 42%, #000 15%, transparent 72%);
+  mask-image: radial-gradient(ellipse 85% 70% at 55% 42%, #000 15%, transparent 72%);
+}
+
+/* The fold's only chromatic moment, and the design doc's rule for it: a
+   gradient spotlight used as atmosphere. Blurred wide enough to read as light
+   falling on the join panel rather than as a shape of its own. */
+.hero-glow {
+  position: absolute;
+  z-index: -1;
+  top: 6%;
+  right: 2%;
+  width: min(460px, 46vw);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 42% 42%,
+    var(--grad-violet) 0%,
+    var(--grad-magenta) 50%,
+    transparent 70%
+  );
+  opacity: 0.13;
+  filter: blur(80px);
+  pointer-events: none;
+}
+
+/* A single glyph, so the halo does the work: at 44px on a phone a coloured dot
+   this small reads as an artefact without it. */
+.hero-accent {
+  color: var(--grad-magenta);
+  text-shadow: 0 0 0.5em rgba(212, 77, 240, 0.5);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 13px 6px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  background: var(--surface-1);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-muted);
+}
+
+.chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--grad-magenta);
+  box-shadow: 0 0 0 3px rgba(212, 77, 240, 0.16);
+}
+
+.hero-specs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 36px;
+  margin-top: 34px;
+  padding-top: 24px;
+  border-top: 1px solid var(--hairline-soft);
+}
+
+.hero-specs dt {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #6b6b6b;
+}
+
+.hero-specs dd {
+  margin: 7px 0 0;
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--ink);
 }
 
 /* Two columns so the join panel sits beside the headline instead of below it:
@@ -288,7 +397,11 @@ button {
    lands here and types five characters, so it sits above everything else. */
 .join {
   padding: 28px;
-  background: var(--surface-1);
+  /* Translucent so the spotlight behind it stays visible: the panel has to sit
+     in the light, not cover it. */
+  background: rgba(20, 20, 20, 0.72);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-xl);
 }
 
@@ -326,6 +439,10 @@ button {
   padding: clamp(56px, 8vw, 96px) 0;
 }
 
+.section-tight {
+  padding-top: 0;
+}
+
 /* Title left, lead right — keeps the display type wide enough to read as a
    poster instead of stacking into a narrow column. */
 .section-head {
@@ -347,56 +464,35 @@ button {
   max-width: 46ch;
 }
 
-.grid {
-  display: grid;
-  gap: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-}
-
-.card-tile {
-  background: var(--surface-1);
-  border-radius: var(--r-xl);
-  padding: 24px;
-}
-
-.card-tile h3 {
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  margin-bottom: 10px;
-}
-
-.card-tile p {
-  font-size: 15px;
-  line-height: 1.4;
-  color: var(--ink-muted);
-}
-
+/* One slab split by hairlines rather than three floating cards: the steps are a
+   sequence, and separate tiles let the eye read them in any order. */
 .steps {
   display: grid;
-  gap: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  counter-reset: step;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background: var(--hairline);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xl);
+  overflow: hidden;
 }
 
 .step {
   background: var(--surface-1);
-  border-radius: var(--r-xl);
-  padding: 24px;
+  padding: 26px 26px 30px;
 }
 
 .step-n {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 9999px;
-  background: var(--surface-3);
-  color: var(--ink);
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 16px;
+  display: block;
+  padding-bottom: 14px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  color: #6b6b6b;
 }
 
 .step h3 {
@@ -407,7 +503,7 @@ button {
 
 .step p {
   font-size: 15px;
-  line-height: 1.4;
+  line-height: 1.45;
   color: var(--ink-muted);
 }
 
@@ -420,13 +516,40 @@ button {
 }
 
 .spotlight {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
   border-radius: var(--r-xxl);
   padding: 32px;
   color: #fff;
-  min-height: 260px;
+  min-height: 280px;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
+}
+
+/* Keeps the flat gradient from reading as a coloured rectangle: a highlight in
+   one corner gives it a light source. */
+.spotlight::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  background: radial-gradient(circle at 80% 8%, rgba(255, 255, 255, 0.26), transparent 58%);
+}
+
+.spotlight-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  margin-bottom: auto;
+  padding: 6px 13px 6px 10px;
+  border-radius: var(--r-pill);
+  background: rgba(0, 0, 0, 0.22);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.9);
 }
 
 .spotlight-violet {
@@ -451,25 +574,148 @@ button {
   max-width: 32ch;
 }
 
-.faq-row {
-  padding: 24px 0;
-  border-bottom: 1px solid var(--hairline-soft);
+.features {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  margin-top: 16px;
 }
-.faq-row:first-child {
+
+.feature {
+  background: var(--surface-1);
+  border: 1px solid var(--hairline-soft);
+  border-radius: var(--r-xl);
+  padding: 24px;
+}
+
+.feature-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.feature-value {
+  font-family: var(--mono);
+  font-size: 28px;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: var(--ink);
+}
+
+.feature-icon {
+  width: 20px;
+  height: 20px;
+  color: #5a5a5a;
+}
+
+.feature-label {
+  display: block;
+  margin-top: 9px;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #6b6b6b;
+}
+
+.feature p {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--hairline-soft);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink-muted);
+}
+
+/* Question and answer side by side, so the column of questions can be skimmed
+   on its own without the answers breaking the rhythm. */
+.faq {
+  margin: 0;
   border-top: 1px solid var(--hairline-soft);
 }
 
-.faq-row h3 {
-  font-size: 17px;
-  letter-spacing: -0.02em;
-  margin-bottom: 10px;
+.faq-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
+  gap: 12px 48px;
+  padding: 26px 0;
+  border-bottom: 1px solid var(--hairline-soft);
 }
 
-.faq-row p {
+.faq-row dt {
+  display: flex;
+  gap: 14px;
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.35;
+  color: var(--ink);
+}
+
+.faq-n {
+  flex: none;
+  padding-top: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: #6b6b6b;
+}
+
+.faq-row dd {
+  margin: 0;
   font-size: 15px;
-  line-height: 1.45;
+  line-height: 1.5;
   color: var(--ink-muted);
   max-width: 60ch;
+}
+
+.repo-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 24px;
+  padding: 28px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xl);
+  background: var(--surface-1);
+  text-decoration: none;
+}
+.repo-card:hover {
+  border-color: #3a3a3a;
+  background: var(--surface-2);
+}
+
+.repo-tag {
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #6b6b6b;
+}
+
+.repo-name {
+  font-family: var(--mono);
+  font-size: 17px;
+  color: var(--ink);
+}
+
+.repo-body {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink-muted);
+  max-width: 60ch;
+}
+
+.repo-mark {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: center;
+  width: 30px;
+  height: 30px;
+  color: #4a4a4a;
+}
+.repo-card:hover .repo-mark {
+  color: var(--ink);
 }
 
 .recents {
@@ -522,13 +768,16 @@ button {
 .site-footer .wrap {
   display: flex;
   gap: 16px;
-  align-items: baseline;
+  align-items: center;
   flex-wrap: wrap;
 }
 
-.site-footer p {
-  max-width: 52ch;
-  line-height: 1.45;
+.site-footer a {
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+.site-footer a:hover {
+  color: var(--ink);
 }
 
 /* ── code input ──────────────────────────────────────────────────────────── */
@@ -634,43 +883,98 @@ button {
   flex-direction: column;
 }
 
+/* Chrome on surface, content on canvas: the bars frame the editor instead of
+   floating on the same plane as the text. */
 .room-bar {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
   flex-wrap: wrap;
-  padding: 12px 20px;
+  padding: 10px 16px;
+  background: var(--surface-1);
   border-bottom: 1px solid var(--hairline);
 }
 
 .room-code {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 14px;
+  gap: 9px;
+  height: 36px;
+  padding: 0 15px 0 12px;
   background: var(--surface-2);
-  border: none;
+  border: 1px solid var(--hairline);
   border-radius: var(--r-md);
   font-family: var(--mono);
-  font-size: 20px;
+  font-size: 17px;
   font-weight: 500;
   color: var(--ink);
-  letter-spacing: 0.12em;
+  letter-spacing: 0.14em;
 }
 .room-code:hover {
   background: var(--surface-3);
+  border-color: #333;
 }
 
-.clock {
-  font-size: 13px;
-  color: var(--ink-muted);
-  transition: color 0.3s ease;
+.wordmark-mark.solo {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  color: #5c5c5c;
+  transition: color 0.15s ease;
 }
-.clock.renewed {
-  color: var(--success);
+.room-code:hover .wordmark-mark.solo {
+  color: var(--accent-blue);
 }
+
+.bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 12px;
+  border-left: 1px solid var(--hairline);
+}
+/* The chrome is surface-1 and so is btn-secondary: on this background the
+   buttons need the darker fill to read as buttons at all. */
+.bar-actions .btn-secondary,
+.stack-tools .btn-secondary {
+  background: var(--surface-2);
+  border-color: var(--hairline);
+}
+.bar-actions .btn-secondary:hover:not(:disabled),
+.stack-tools .btn-secondary:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: #333;
+}
+
+.room-foot {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 9px 16px;
+  background: var(--surface-1);
+  border-top: 1px solid var(--hairline);
+  font-size: 12.5px;
+  color: #6b6b6b;
+}
+
 .clock.urgent {
   color: var(--warning);
+}
+/* Deliberately not a colour change: the reset should be legible, not loud. */
+.clock-renewed {
+  color: var(--ink-muted);
+  animation: fade-in 0.4s ease;
+}
+
+.foot-dirty {
+  color: var(--ink-muted);
+}
+
+.tools-hint {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: #4d4d4d;
 }
 
 .room-bar-spacer {
@@ -681,8 +985,7 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
-  color: var(--ink-muted);
+  color: inherit;
 }
 .status-dot::before {
   content: "";
@@ -722,13 +1025,34 @@ button {
 }
 
 .room-body {
+  position: relative;
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(0, 1fr) auto var(--stack-w, 420px);
   min-height: 0;
 }
-.room-body.with-side {
-  grid-template-columns: 1fr 300px;
+
+.resizer {
+  position: relative;
+  width: 7px;
+  cursor: col-resize;
+  /* Without this the browser claims the drag for scrolling on touch. */
+  touch-action: none;
+}
+.resizer::before {
+  content: "";
+  position: absolute;
+  inset: 0 3px;
+  background: var(--hairline);
+  transition: inset 0.12s ease, background-color 0.12s ease;
+}
+.resizer:hover::before,
+.resizer:focus-visible::before {
+  inset: 0 2px;
+  background: var(--accent-blue);
+}
+.resizer:focus-visible {
+  outline: none;
 }
 
 .editor-pane {
@@ -758,58 +1082,137 @@ button {
   color: #5c5c5c;
 }
 
-.editor-tools {
+.drop-veil {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding: 10px 16px;
-  border-top: 1px solid var(--hairline-soft);
+  justify-content: center;
+  gap: 14px;
+  /* The drop lands on the container underneath; the veil is only a sign. */
+  pointer-events: none;
+  background: rgba(9, 9, 9, 0.82);
+  border: 2px dashed var(--accent-blue);
+  color: var(--ink);
+  font-size: 15px;
+  animation: fade-in 0.14s ease;
+}
+.drop-veil .icon {
+  width: 30px;
+  height: 30px;
+  color: var(--accent-blue);
+}
+
+/* ── menus ───────────────────────────────────────────────────────────────── */
+
+.menu {
+  position: relative;
+}
+
+.menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 12px;
+  background: var(--surface-2);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
   font-size: 13px;
   color: var(--ink-muted);
 }
-
-.side {
-  border-left: 1px solid var(--hairline);
-  padding: 20px 16px;
-  overflow-y: auto;
-  background: var(--surface-1);
+.menu-trigger:hover,
+.menu-trigger.open {
+  background: var(--surface-3);
+  color: var(--ink);
 }
 
-.side h3 {
-  font-size: 12px;
+.badge {
+  min-width: 17px;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--accent-blue);
+  color: #fff;
+  font-size: 11px;
   font-weight: 600;
-  color: var(--ink-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  margin-bottom: 12px;
+  line-height: 17px;
+  text-align: center;
 }
 
-.side section + section {
-  margin-top: 28px;
-}
-
-.card {
+.menu-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  z-index: 30;
+  width: 288px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 8px;
   background: var(--surface-2);
-  border: 1px solid transparent;
+  border: 1px solid var(--hairline);
   border-radius: var(--r-lg);
-  padding: 14px;
-  margin-bottom: 8px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.55);
+}
+.menu-left {
+  left: 0;
+}
+.menu-right {
+  right: 0;
 }
 
-.card-pending {
-  border-color: var(--accent-blue);
+.menu-group + .menu-group {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.menu-group h3 {
+  padding: 4px 8px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #6b6b6b;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  padding: 9px 8px;
+  background: none;
+  border: none;
+  border-radius: var(--r-sm);
+  font-size: 14px;
+  color: var(--ink);
+  text-align: left;
+}
+.menu-item:hover {
   background: var(--surface-3);
 }
-
-.card-fingerprint {
-  font-family: var(--mono);
-  font-size: 16px;
-  color: var(--ink);
-  margin-bottom: 4px;
+.menu-item.danger {
+  color: var(--error);
+}
+.menu-item.danger:hover {
+  background: rgba(255, 85, 119, 0.12);
 }
 
-.card-meta {
+.pending {
+  padding: 12px;
+  margin-bottom: 6px;
+  background: var(--surface-3);
+  border: 1px solid var(--accent-blue);
+  border-radius: var(--r-md);
+}
+
+.pending-fingerprint {
+  font-family: var(--mono);
+  font-size: 15px;
+  color: var(--ink);
+}
+
+.pending-meta {
+  margin-top: 3px;
   font-size: 12px;
   color: var(--ink-muted);
   overflow: hidden;
@@ -817,22 +1220,29 @@ button {
   white-space: nowrap;
 }
 
-.card-actions {
+.pending-actions {
   display: flex;
   gap: 6px;
-  margin-top: 12px;
+  margin-top: 10px;
 }
 
 .member-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--hairline-soft);
+  padding: 7px 8px;
   font-size: 14px;
 }
-.member-row:last-child {
-  border-bottom: none;
+
+.member-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: #444;
+}
+.member-dot.online {
+  background: var(--success);
 }
 
 .member-name {
@@ -845,64 +1255,155 @@ button {
 }
 
 .tag {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 500;
-  padding: 3px 9px;
+  padding: 2px 8px;
   border-radius: var(--r-pill);
   background: var(--surface-3);
   color: var(--ink-muted);
 }
-.tag-online {
-  background: rgba(34, 197, 94, 0.15);
-  color: var(--success);
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: var(--r-sm);
+  color: #6b6b6b;
+}
+.icon-btn:hover {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+.icon-btn .icon {
+  width: 16px;
+  height: 16px;
 }
 
 .empty {
   font-size: 13px;
+  line-height: 1.5;
   color: var(--ink-muted);
-  padding: 4px 0;
+  padding: 4px 2px;
 }
 
-/* ── files ───────────────────────────────────────────────────────────────── */
+/* ── stack: pastes and files, one panel, two tabs ────────────────────────── */
 
-.room-body.dropping {
-  outline: 2px dashed var(--accent-blue);
-  outline-offset: -6px;
-}
-
-.files {
-  border-top: 1px solid var(--hairline);
+.stack {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   background: var(--surface-1);
-  padding: 12px 16px;
-  max-height: 30vh;
-  overflow-y: auto;
 }
 
-.files-head {
+/* Tabs, tools and cards all start at 12px: one left edge down the panel. */
+.tabs {
   display: flex;
+  flex: none;
+  gap: 20px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.tab {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  font-size: 12px;
-  font-weight: 600;
+  gap: 7px;
+  padding: 13px 0;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--ink-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+}
+.tab:hover {
+  color: var(--ink);
+}
+.tab.active {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
 }
 
-.file-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 0;
+.tab-n {
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+.stack-tools {
+  flex: none;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--hairline-soft);
 }
-.file-row:last-child {
-  border-bottom: none;
+
+.stack-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.entry {
+  padding: 12px;
+  margin-bottom: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--hairline-soft);
+  border-radius: var(--r-md);
+}
+.entry:hover {
+  border-color: var(--hairline);
+}
+
+/* Four lines is enough to recognise a key or a stack trace; the whole point is
+   that the copy button works without reading it. Clamped rather than cropped so
+   an entry that fits shows no ellipsis at all. */
+.entry-preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink-muted);
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.entry-foot {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 10px;
+}
+
+/* Present but quiet until the card is the one being looked at. */
+.entry-foot .icon-btn {
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+.entry:hover .entry-foot .icon-btn,
+.entry-foot .icon-btn:focus-visible {
+  opacity: 1;
+}
+
+.entry-meta {
+  font-size: 12px;
+  color: #6b6b6b;
 }
 
 .file-main {
-  flex: 1;
   min-width: 0;
 }
 
@@ -915,10 +1416,6 @@ button {
   white-space: nowrap;
 }
 
-.file-meta {
-  font-size: 12px;
-  color: var(--ink-muted);
-}
 .file-error {
   color: var(--error);
 }
@@ -926,7 +1423,7 @@ button {
 .file-bar {
   display: block;
   height: 3px;
-  margin-top: 6px;
+  margin-top: 8px;
   border-radius: var(--r-pill);
   background: var(--surface-3);
   overflow: hidden;
@@ -938,68 +1435,115 @@ button {
   transition: width 0.2s ease;
 }
 
-/* ── history ─────────────────────────────────────────────────────────────── */
+/* ── modal ───────────────────────────────────────────────────────────────── */
 
-.history {
-  border-top: 1px solid var(--hairline);
-  background: var(--surface-1);
-  max-height: 34vh;
-  overflow-y: auto;
-}
-
-.history-head {
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
   display: flex;
   align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 12px 20px;
-  background: none;
-  border: none;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--ink-muted);
-  text-align: left;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(3px);
 }
-.history-head:hover {
+
+.modal {
+  width: min(420px, 100%);
+  padding: 26px;
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xl);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+}
+
+.modal h2 {
+  font-size: 20px;
+  letter-spacing: -0.02em;
   color: var(--ink);
+  margin-bottom: 10px;
 }
 
-.history-list {
-  padding: 0 12px 12px;
+.modal p {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink-muted);
 }
 
-.history-item {
+.modal-actions {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  width: 100%;
-  padding: 12px;
-  background: var(--surface-2);
-  border: none;
-  border-radius: var(--r-md);
-  margin-bottom: 6px;
-  text-align: left;
-}
-.history-item:hover {
-  background: var(--surface-3);
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 22px;
 }
 
-.history-preview {
-  flex: 1;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--ink-muted);
-  line-height: 1.45;
-  max-height: 2.9em;
-  overflow: hidden;
-  white-space: pre-wrap;
-  word-break: break-all;
+/* ── scrollbars and motion ───────────────────────────────────────────────── */
+
+/* The default light-on-dark scrollbar is the loudest thing on the screen. */
+.stack-body,
+.editor,
+.menu-panel {
+  scrollbar-width: thin;
+  scrollbar-color: #303030 transparent;
+}
+.stack-body::-webkit-scrollbar,
+.editor::-webkit-scrollbar,
+.menu-panel::-webkit-scrollbar {
+  width: 10px;
+}
+.stack-body::-webkit-scrollbar-thumb,
+.editor::-webkit-scrollbar-thumb,
+.menu-panel::-webkit-scrollbar-thumb {
+  background: #303030;
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: var(--r-pill);
+}
+.stack-body::-webkit-scrollbar-thumb:hover,
+.editor::-webkit-scrollbar-thumb:hover,
+.menu-panel::-webkit-scrollbar-thumb:hover {
+  background: #454545;
+  background-clip: content-box;
 }
 
-.history-age {
-  font-size: 12px;
-  color: var(--ink-muted);
-  white-space: nowrap;
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 10px);
+  }
+}
+
+.menu-panel {
+  animation: pop-in 0.13s ease;
+}
+.modal-backdrop {
+  animation: fade-in 0.15s ease;
+}
+.modal {
+  animation: pop-in 0.17s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* ── misc ────────────────────────────────────────────────────────────────── */
@@ -1018,7 +1562,9 @@ button {
 .toast {
   position: fixed;
   left: 50%;
-  bottom: 24px;
+  /* Clear of the status bar: a toast that covers the clock hides the one thing
+     the user is most likely checking. */
+  bottom: 56px;
   transform: translateX(-50%);
   display: flex;
   align-items: center;
@@ -1027,8 +1573,11 @@ button {
   background: var(--surface-3);
   color: var(--ink);
   border-radius: var(--r-pill);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5);
   font-size: 14px;
   z-index: 20;
+  animation: toast-in 0.18s ease;
 }
 
 .toast button {
@@ -1063,20 +1612,73 @@ button {
   .section-head h2 {
     max-width: 16ch;
   }
+  .faq-row {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .faq-row dd {
+    padding-left: 30px;
+  }
+}
+
+/* The three bar buttons are what push the bar into a second row first; their
+   icons carry the meaning well enough at this width. */
+@media (max-width: 900px) {
+  .bar-actions .btn-label {
+    display: none;
+  }
+  .bar-actions .btn {
+    padding: 8px 11px;
+  }
 }
 
 @media (max-width: 760px) {
-  /* Stacked, the editor takes the leftover height and the device list sizes to
-     its content; auto rows would split the space evenly and leave the editor
-     showing three lines. The minmax keeps it usable when approvals pile up. */
-  .room-body.with-side {
+  /* Stacked, the editor keeps a usable minimum and the stack takes the rest;
+     even rows would leave the editor showing three lines. */
+  .room-body {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(160px, 1fr) auto;
-    overflow-y: auto;
+    grid-template-rows: minmax(180px, 1fr) minmax(200px, 1fr);
   }
-  .side {
-    border-left: none;
+  .resizer {
+    display: none;
+  }
+  .stack {
     border-top: 1px solid var(--hairline);
+  }
+  /* Narrow enough and the bar wraps, dragging the trigger away from the right
+     edge; anchored to the trigger the panel would hang off-screen, so it hangs
+     off the bar instead. */
+  .room-bar {
+    position: relative;
+    gap: 8px 10px;
+    padding: 10px 12px;
+  }
+  /* The bar has to wrap here anyway, so the actions get the whole second row —
+     and with a row to themselves the labels fit again. */
+  .bar-actions {
+    order: 1;
+    width: 100%;
+    padding-left: 0;
+    border-left: none;
+  }
+  .bar-actions .btn {
+    flex: 1;
+    padding: 8px 10px;
+  }
+  .bar-actions .btn-label {
+    display: inline;
+  }
+  .menu {
+    position: static;
+  }
+  .menu-panel {
+    top: calc(100% + 6px);
+    right: 12px;
+    left: auto;
+    width: min(320px, calc(100vw - 24px));
+  }
+  .tools-hint {
+    display: none;
   }
   .code-input {
     gap: 8px;
@@ -1092,5 +1694,11 @@ button {
   .spotlight {
     min-height: 220px;
     padding: 24px;
+  }
+  .repo-card {
+    padding: 22px;
+  }
+  .repo-name {
+    font-size: 15px;
   }
 }

@@ -9,8 +9,11 @@ import {
   type Snapshot,
 } from "./api.ts";
 import { connect, type ConnectionStatus, type ServerEvent } from "./transport.ts";
-import { renameCode } from "./store.ts";
+import { renameCode, saveStackWidth, savedStackWidth } from "./store.ts";
 import { sendFile } from "./uploads.ts";
+import { Logo } from "./Logo.tsx";
+import { Icon } from "./icons.tsx";
+import { Menu, Modal } from "./ui.tsx";
 import { copyText, downloadText, formatAge, formatBytes, formatRemaining, formatSize } from "./format.ts";
 
 type State = {
@@ -145,6 +148,21 @@ function reducer(state: State, action: Action): State {
   }
 }
 
+const STACK_DEFAULT = 420;
+const STACK_MIN = 280;
+/** The editor keeps this much room no matter how far the divider is dragged. */
+const EDITOR_MIN = 360;
+
+const clampStack = (width: number) =>
+  Math.max(STACK_MIN, Math.min(width, Math.max(STACK_MIN, window.innerWidth - EDITOR_MIN)));
+
+type Confirmation = {
+  title: string;
+  body: string;
+  label: string;
+  run: () => void;
+};
+
 type Props = {
   token: string;
   onExit: (reason?: string) => void;
@@ -156,11 +174,14 @@ export function Room({ token, onExit, onCode }: Props) {
   const [state, dispatch] = useReducer(reducer, initial);
   const [now, setNow] = useState(Date.now());
   const [toast, setToast] = useState<{ text: string; undo?: () => void } | null>(null);
-  const [showHistory, setShowHistory] = useState(false);
+  const [tab, setTab] = useState<"text" | "files">("text");
+  const [confirming, setConfirming] = useState<Confirmation | null>(null);
   const [failed, setFailed] = useState<Record<string, string>>({});
   const [dragging, setDragging] = useState(false);
+  const [stackWidth, setStackWidth] = useState(() => clampStack(savedStackWidth() ?? STACK_DEFAULT));
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const pickerRef = useRef<HTMLInputElement>(null);
+  const resizeFrom = useRef<{ x: number; width: number } | null>(null);
   /** The picked File never leaves the tab: it is what a resume reads from. */
   const localFiles = useRef(new Map<string, File>());
   const queue = useRef<Promise<unknown>>(Promise.resolve());
@@ -256,15 +277,52 @@ export function Room({ token, onExit, onCode }: Props) {
         event.preventDefault();
         downloadText(state.draft, `cloudnt-${state.code}.txt`);
       }
+      if (event.key === "n") {
+        event.preventDefault();
+        void pinCurrent();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [state.draft, state.code]);
 
+  useEffect(() => {
+    const onResize = () => setStackWidth((width) => clampStack(width));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   const handleCopy = async () => {
     if (await copyText(state.draft)) return notify("Copiado al portapapeles");
     editorRef.current?.select();
     notify("Sin permiso de portapapeles: el texto quedó seleccionado, pulsa Ctrl+C");
+  };
+
+  const pinCurrent = async () => {
+    if (state.draft.trim() === "") return;
+    await guard(async () => {
+      // Pinning takes the server's copy, so the debounced write has to land
+      // first or the entry misses the last keystrokes of a fresh paste.
+      if (dirty) {
+        const { rev } = await api.putText(token, state.draft, state.serverRev);
+        dispatch({ type: "commit", text: state.draft, rev });
+      }
+      await api.pinText(token);
+      setTab("text");
+      notify("Fijado como pegada");
+    });
+  };
+
+  const copyEntry = async (text: string) => {
+    notify((await copyText(text)) ? "Pegada copiada" : "Sin permiso de portapapeles");
+  };
+
+  /** The old single-buffer behaviour, kept as one deliberate action. */
+  const copyAll = async () => {
+    const all = [state.draft, ...state.history.map((item) => item.content)]
+      .filter((text) => text.trim() !== "")
+      .join("\n\n");
+    notify((await copyText(all)) ? "Todo copiado al portapapeles" : "Sin permiso de portapapeles");
   };
 
   const keepMine = async () => {
@@ -321,7 +379,7 @@ export function Room({ token, onExit, onCode }: Props) {
   if (!state.ready) {
     return (
       <div class="center-note">
-        <span class="wordmark">cloudnt</span>
+        <Logo />
         <p style="color: var(--ink-muted)">Abriendo la sala...</p>
       </div>
     );
@@ -339,39 +397,180 @@ export function Room({ token, onExit, onCode }: Props) {
             notify((await copyText(link)) ? "Enlace copiado" : link);
           }}
         >
+          <Logo mark />
           {state.code}
         </button>
 
-        <span
-          class={`clock${justRenewed ? " renewed" : ""}${expiringSoon ? " urgent" : ""}`}
-          aria-live="polite"
-        >
-          {justRenewed ? "temporizador reiniciado" : `se borra en ${formatRemaining(remaining)} sin actividad`}
-        </span>
+        <div class="bar-actions">
+          <button type="button" class="btn btn-secondary btn-sm" title="Alt+C" onClick={() => void handleCopy()}>
+            <Icon name="copy" />
+            <span class="btn-label">Copiar</span>
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
+            title="Alt+N · guarda este texto como una pegada aparte, para que el siguiente no lo pise"
+            disabled={state.draft.trim() === ""}
+            onClick={() => void pinCurrent()}
+          >
+            <Icon name="pin" />
+            <span class="btn-label">Nueva pegada</span>
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
+            title="Alt+S"
+            onClick={() => downloadText(state.draft, `cloudnt-${state.code}.txt`)}
+          >
+            <Icon name="download" />
+            <span class="btn-label">Descargar</span>
+          </button>
+        </div>
 
         <span class="room-bar-spacer" />
 
-        <span class={`status-dot${state.status === "online" ? "" : " offline"}`}>
-          {state.status === "online" ? "conectado" : "reconectando"}
-        </span>
+        <Menu
+          title="Dispositivos en la sala"
+          label={
+            <>
+              <Icon name="devices" />
+              {state.members.length}
+              {isOwner && state.pending.length > 0 ? <span class="badge">{state.pending.length}</span> : null}
+            </>
+          }
+        >
+          {isOwner && state.pending.length > 0 ? (
+            <div class="menu-group">
+              <h3>Esperando aprobación</h3>
+              {state.pending.map((request) => (
+                <div key={request.id} class="pending">
+                  <div class="pending-fingerprint">{request.fingerprint}</div>
+                  <div class="pending-meta" title={request.userAgent}>
+                    {request.ip} · {formatAge(request.createdAt)}
+                  </div>
+                  <div class="pending-actions">
+                    <button
+                      type="button"
+                      class="btn btn-primary btn-sm"
+                      onClick={() => void guard(() => api.approve(token, request.id))}
+                    >
+                      Aprobar
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-secondary btn-sm"
+                      onClick={() =>
+                        void guard(async () => {
+                          await api.reject(token, request.id);
+                          notify(`Rechazado ${request.fingerprint}`, () =>
+                            void guard(() => api.approve(token, request.id)),
+                          );
+                        })
+                      }
+                    >
+                      Rechazar
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          <div class="menu-group">
+            <h3>Dispositivos ({state.members.length})</h3>
+            {state.members.map((member) => (
+              <div key={member.id} class="member-row">
+                <span class={`member-dot${member.online ? " online" : ""}`} aria-hidden="true" />
+                <span class="member-name">{member.fingerprint}</span>
+                {member.id === state.memberId ? <span class="tag">tú</span> : null}
+                {member.role === "owner" ? <span class="tag">dueño</span> : null}
+                {isOwner && member.role !== "owner" ? (
+                  <button
+                    type="button"
+                    class="icon-btn"
+                    title={`Expulsar a ${member.fingerprint}`}
+                    onClick={() => void guard(() => api.kick(token, member.id))}
+                  >
+                    <Icon name="close" />
+                  </button>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </Menu>
 
         {isOwner ? (
-          <button
-            type="button"
-            class="btn btn-danger btn-sm"
-            onClick={() =>
-              void guard(async () => {
-                const { rev } = await api.clearRoom(token);
-                // Own echo does not update the draft, to avoid overwriting ongoing
-                // typing. Clearing is the exception: the editor must end up empty.
-                dispatch({ type: "draft", text: "" });
-                dispatch({ type: "commit", text: "", rev });
-                notify("Sala vaciada");
-              })
-            }
-          >
-            Vaciar
-          </button>
+          <Menu title="Ajustes de la sala" label={<Icon name="settings" />}>
+            <div class="menu-group">
+              <h3>Acceso</h3>
+              <button
+                type="button"
+                class="menu-item"
+                onClick={() =>
+                  void guard(async () => {
+                    const active = state.autoApproveUntil > Date.now();
+                    await api.setAutoApprove(token, active ? 0 : 5);
+                    notify(active ? "Auto-aprobar desactivado" : "Auto-aprobar activo 5 min");
+                  })
+                }
+              >
+                {state.autoApproveUntil > Date.now()
+                  ? `Auto-aprobar: ${formatRemaining(state.autoApproveUntil - now)}`
+                  : "Auto-aprobar 5 min"}
+              </button>
+              <button
+                type="button"
+                class="menu-item"
+                onClick={() =>
+                  void guard(async () => {
+                    await api.rotate(token);
+                    notify("Código rotado");
+                  })
+                }
+              >
+                Cambiar el código
+              </button>
+            </div>
+            <div class="menu-group">
+              <h3>Zona de riesgo</h3>
+              <button
+                type="button"
+                class="menu-item danger"
+                onClick={() =>
+                  setConfirming({
+                    title: "¿Vaciar la sala?",
+                    body: "Se borran el texto y las pegadas de todos los que estén dentro. Los archivos se quedan. No se puede deshacer.",
+                    label: "Vaciar",
+                    run: () =>
+                      void guard(async () => {
+                        const { rev } = await api.clearRoom(token);
+                        // Own echo does not update the draft, to avoid overwriting ongoing
+                        // typing. Clearing is the exception: the editor must end up empty.
+                        dispatch({ type: "draft", text: "" });
+                        dispatch({ type: "commit", text: "", rev });
+                        notify("Sala vaciada");
+                      }),
+                  })
+                }
+              >
+                Vaciar el contenido
+              </button>
+              <button
+                type="button"
+                class="menu-item danger"
+                onClick={() =>
+                  setConfirming({
+                    title: "¿Cerrar la sala?",
+                    body: "La sala desaparece ahora mismo con el texto, las pegadas y los archivos, y todos los conectados salen. No se puede deshacer.",
+                    label: "Cerrar la sala",
+                    run: () => void guard(() => api.closeRoom(token)),
+                  })
+                }
+              >
+                Cerrar la sala
+              </button>
+            </div>
+          </Menu>
         ) : null}
       </header>
 
@@ -389,30 +588,32 @@ export function Room({ token, onExit, onCode }: Props) {
       ) : null}
 
       {expiringSoon ? (
-        <div class="banner banner-warn">
+        <div class="banner banner-warn" role="status">
           <strong>Esta sala se borra en {formatRemaining(remaining)}.</strong>
-          <button
-            type="button"
-            class="btn btn-secondary btn-sm"
-            onClick={() => void guard(() => api.keepAlive(token))}
-          >
+          <button type="button" class="btn btn-secondary btn-sm" onClick={() => void guard(() => api.keepAlive(token))}>
             Mantener viva
           </button>
         </div>
       ) : null}
 
       <div
-        class={`room-body with-side${dragging ? " dropping" : ""}`}
+        class={`room-body${dragging ? " dropping" : ""}`}
+        style={`--stack-w:${stackWidth}px`}
         onDragOver={(event) => {
           if (!event.dataTransfer?.types.includes("Files")) return;
           event.preventDefault();
           setDragging(true);
         }}
-        onDragLeave={() => setDragging(false)}
+        // Moving onto a child fires dragleave on the container; without the
+        // containment check the overlay flickers on every hop.
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
+        }}
         onDrop={(event) => {
           if (!event.dataTransfer?.files.length) return;
           event.preventDefault();
           setDragging(false);
+          setTab("files");
           void addFiles(event.dataTransfer.files);
         }}
       >
@@ -427,65 +628,144 @@ export function Room({ token, onExit, onCode }: Props) {
             placeholder="Pega aquí lo que quieras mover a la otra máquina."
             onInput={(event) => dispatch({ type: "draft", text: event.currentTarget.value })}
           />
-          <div class="editor-tools">
-            <button type="button" class="btn btn-secondary btn-sm" onClick={() => void handleCopy()}>
-              Copiar
+        </div>
+
+        <div
+          class="resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Ancho del panel lateral"
+          aria-valuenow={stackWidth}
+          aria-valuemin={STACK_MIN}
+          aria-valuemax={Math.round(window.innerWidth - EDITOR_MIN)}
+          tabIndex={0}
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            resizeFrom.current = { x: event.clientX, width: stackWidth };
+          }}
+          onPointerMove={(event) => {
+            const from = resizeFrom.current;
+            if (from) setStackWidth(clampStack(from.width - (event.clientX - from.x)));
+          }}
+          onPointerUp={(event) => {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+            resizeFrom.current = null;
+            saveStackWidth(stackWidth);
+          }}
+          onKeyDown={(event) => {
+            const step = event.key === "ArrowLeft" ? 24 : event.key === "ArrowRight" ? -24 : 0;
+            if (step === 0) return;
+            event.preventDefault();
+            const next = clampStack(stackWidth + step);
+            setStackWidth(next);
+            saveStackWidth(next);
+          }}
+        />
+
+        <aside class="stack">
+          <div class="tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "text"}
+              class={`tab${tab === "text" ? " active" : ""}`}
+              onClick={() => setTab("text")}
+            >
+              Pegadas<span class="tab-n">{state.history.length}</span>
             </button>
             <button
               type="button"
-              class="btn btn-secondary btn-sm"
-              onClick={() => downloadText(state.draft, `cloudnt-${state.code}.txt`)}
+              role="tab"
+              aria-selected={tab === "files"}
+              class={`tab${tab === "files" ? " active" : ""}`}
+              onClick={() => setTab("files")}
             >
-              Descargar
+              Archivos<span class="tab-n">{state.files.length}</span>
             </button>
-            <span class="room-bar-spacer" />
-            <span>{formatBytes(state.draft)}</span>
-            <span>·</span>
-            <span>{dirty ? "sin guardar" : "sincronizado"}</span>
-            <span>·</span>
-            <span>Alt+C copiar, Alt+S descargar</span>
           </div>
 
-          <div class="files">
-            <div class="files-head">
-              <span>Archivos ({state.files.length})</span>
-              <span class="room-bar-spacer" />
-              <button
-                type="button"
-                class="btn btn-secondary btn-sm"
-                onClick={() => pickerRef.current?.click()}
-              >
-                Subir archivo
+          <div class="stack-tools">
+            {tab === "text" ? (
+              <button type="button" class="btn btn-secondary btn-sm" onClick={() => void copyAll()}>
+                <Icon name="copy" />
+                Copiar todo
               </button>
-              <input
-                ref={pickerRef}
-                type="file"
-                multiple
-                class="sr-only"
-                onChange={(event) => {
-                  void addFiles(event.currentTarget.files);
-                  event.currentTarget.value = "";
-                }}
-              />
-            </div>
+            ) : (
+              <>
+                <button type="button" class="btn btn-secondary btn-sm" onClick={() => pickerRef.current?.click()}>
+                  <Icon name="plus" />
+                  Subir archivo
+                </button>
+                <input
+                  ref={pickerRef}
+                  type="file"
+                  multiple
+                  class="sr-only"
+                  onChange={(event) => {
+                    void addFiles(event.currentTarget.files);
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </>
+            )}
+          </div>
 
-            {state.files.length === 0 ? (
-              <p class="empty">Arrastra un archivo aquí o pulsa Subir. Se borran con la sala.</p>
+          <div class="stack-body">
+            {tab === "text" ? (
+              state.history.length === 0 ? (
+                <p class="empty">
+                  Cada vez que alguien pega algo distinto, lo anterior queda aquí como una pegada aparte. También
+                  puedes fijar el texto actual sin esperar a que lo reemplacen.
+                </p>
+              ) : (
+                state.history.map((item) => (
+                  <article key={item.id} class="entry">
+                    <pre class="entry-preview">{item.content.slice(0, 400)}</pre>
+                    <div class="entry-foot">
+                      <span class="entry-meta">
+                        {formatBytes(item.content)} · {formatAge(item.created_at)}
+                      </span>
+                      <span class="room-bar-spacer" />
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        title="Copiar esta pegada"
+                        onClick={() => void copyEntry(item.content)}
+                      >
+                        <Icon name="copy" />
+                      </button>
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        title="Traerla al editor"
+                        onClick={() => dispatch({ type: "draft", text: item.content })}
+                      >
+                        <Icon name="history" />
+                      </button>
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        title="Quitar esta pegada"
+                        onClick={() => void guard(() => api.removeEntry(token, item.id))}
+                      >
+                        <Icon name="trash" />
+                      </button>
+                    </div>
+                  </article>
+                ))
+              )
+            ) : state.files.length === 0 ? (
+              <p class="empty">Arrastra un archivo a la sala o pulsa Subir. Se borran con ella.</p>
             ) : (
               state.files.map((item) => {
                 const percent = Math.round((item.received / item.chunks) * 100);
                 const error = failed[item.id];
                 const ready = item.status === "ready";
                 return (
-                  <div key={item.id} class="file-row">
+                  <article key={item.id} class="entry">
                     <div class="file-main">
                       <span class="file-name" title={item.name}>
                         {item.name}
-                      </span>
-                      <span class={`file-meta${error ? " file-error" : ""}`}>
-                        {formatSize(item.size)}
-                        {ready ? "" : ` · ${percent}%`}
-                        {error ? ` · ${error}` : ""}
                       </span>
                       {ready ? null : (
                         <span class="file-bar">
@@ -493,189 +773,101 @@ export function Room({ token, onExit, onCode }: Props) {
                         </span>
                       )}
                     </div>
-
-                    {ready ? (
-                      <button
-                        type="button"
-                        class="btn btn-secondary btn-sm"
-                        onClick={() =>
-                          void guard(async () => {
-                            const { ticket } = await api.downloadTicket(token, item.id);
-                            location.href = `/api/download/${ticket}`;
-                          })
-                        }
-                      >
-                        Descargar
-                      </button>
-                    ) : error && localFiles.current.has(item.id) ? (
-                      <button
-                        type="button"
-                        class="btn btn-primary btn-sm"
-                        onClick={() => runUpload(item.id)}
-                      >
-                        Reanudar
-                      </button>
-                    ) : null}
-
-                    {isOwner || item.authorId === state.memberId ? (
-                      <button
-                        type="button"
-                        class="btn btn-ghost"
-                        onClick={() =>
-                          void guard(async () => {
-                            localFiles.current.delete(item.id);
-                            await api.removeFile(token, item.id);
-                          })
-                        }
-                      >
-                        Quitar
-                      </button>
-                    ) : null}
-                  </div>
+                    <div class="entry-foot">
+                      <span class={`entry-meta${error ? " file-error" : ""}`}>
+                        {formatSize(item.size)}
+                        {ready ? "" : ` · ${percent}%`}
+                        {error ? ` · ${error}` : ""}
+                      </span>
+                      <span class="room-bar-spacer" />
+                      {ready ? (
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          title="Descargar"
+                          onClick={() =>
+                            void guard(async () => {
+                              const { ticket } = await api.downloadTicket(token, item.id);
+                              location.href = `/api/download/${ticket}`;
+                            })
+                          }
+                        >
+                          <Icon name="download" />
+                        </button>
+                      ) : error && localFiles.current.has(item.id) ? (
+                        <button type="button" class="btn btn-primary btn-sm" onClick={() => runUpload(item.id)}>
+                          Reanudar
+                        </button>
+                      ) : null}
+                      {isOwner || item.authorId === state.memberId ? (
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          title="Quitar"
+                          onClick={() =>
+                            void guard(async () => {
+                              localFiles.current.delete(item.id);
+                              await api.removeFile(token, item.id);
+                            })
+                          }
+                        >
+                          <Icon name="trash" />
+                        </button>
+                      ) : null}
+                    </div>
+                  </article>
                 );
               })
             )}
           </div>
-
-          <div class="history">
-            <button type="button" class="history-head" onClick={() => setShowHistory((v) => !v)}>
-              {showHistory ? "▾" : "▸"} Historial de la sala ({state.history.length})
-            </button>
-            {showHistory ? (
-              <div class="history-list">
-                {state.history.length === 0 ? (
-                  <p class="empty" style="padding-left: 12px;">
-                    Aquí se guardan los últimos {10} textos que se reemplazaron por completo.
-                  </p>
-                ) : (
-                  state.history.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      class="history-item"
-                      title="Restaurar este texto"
-                      onClick={() => dispatch({ type: "draft", text: item.content })}
-                    >
-                      <span class="history-preview">{item.content.slice(0, 240)}</span>
-                      <span class="history-age">{formatAge(item.created_at)}</span>
-                    </button>
-                  ))
-                )}
-              </div>
-            ) : null}
-          </div>
-        </div>
-
-        <aside class="side">
-          {isOwner ? (
-            <section>
-              <h3>Esperando aprobación</h3>
-              {state.pending.length === 0 ? (
-                <p class="empty">Nadie esperando.</p>
-              ) : (
-                state.pending.map((request) => (
-                  <div key={request.id} class="card card-pending">
-                    <div class="card-fingerprint">{request.fingerprint}</div>
-                    <div class="card-meta" title={request.userAgent}>
-                      {request.ip} · {formatAge(request.createdAt)}
-                    </div>
-                    <div class="card-actions">
-                      <button
-                        type="button"
-                        class="btn btn-primary btn-sm"
-                        onClick={() => void guard(() => api.approve(token, request.id))}
-                      >
-                        Aprobar
-                      </button>
-                      <button
-                        type="button"
-                        class="btn btn-secondary btn-sm"
-                        onClick={() =>
-                          void guard(async () => {
-                            await api.reject(token, request.id);
-                            notify(`Rechazado ${request.fingerprint}`, () =>
-                              void guard(() => api.approve(token, request.id)),
-                            );
-                          })
-                        }
-                      >
-                        Rechazar
-                      </button>
-                    </div>
-                  </div>
-                ))
-              )}
-            </section>
-          ) : null}
-
-          <section>
-            <h3>Dispositivos</h3>
-            {state.members.map((member) => (
-              <div key={member.id} class="member-row">
-                <span class="member-name" title={member.fingerprint}>
-                  {member.fingerprint}
-                </span>
-                {member.id === state.memberId ? <span class="tag">tú</span> : null}
-                {member.role === "owner" ? <span class="tag">dueño</span> : null}
-                {member.online ? <span class="tag tag-online">activo</span> : null}
-                {isOwner && member.role !== "owner" ? (
-                  <button
-                    type="button"
-                    class="btn btn-ghost"
-                    title="Expulsar"
-                    onClick={() => void guard(() => api.kick(token, member.id))}
-                  >
-                    Expulsar
-                  </button>
-                ) : null}
-              </div>
-            ))}
-          </section>
-
-          {isOwner ? (
-            <section>
-              <h3>Acceso</h3>
-              <button
-                type="button"
-                class="btn btn-secondary btn-sm"
-                style="width: 100%; margin-bottom: 6px;"
-                onClick={() =>
-                  void guard(async () => {
-                    const active = state.autoApproveUntil > Date.now();
-                    await api.setAutoApprove(token, active ? 0 : 5);
-                    notify(active ? "Auto-aprobar desactivado" : "Auto-aprobar activo 5 min");
-                  })
-                }
-              >
-                {state.autoApproveUntil > Date.now()
-                  ? `Auto-aprobar: ${formatRemaining(state.autoApproveUntil - now)}`
-                  : "Auto-aprobar 5 min"}
-              </button>
-              <button
-                type="button"
-                class="btn btn-secondary btn-sm"
-                style="width: 100%; margin-bottom: 6px;"
-                onClick={() =>
-                  void guard(async () => {
-                    await api.rotate(token);
-                    notify("Código rotado");
-                  })
-                }
-              >
-                Cambiar el código
-              </button>
-              <button
-                type="button"
-                class="btn btn-danger btn-sm"
-                style="width: 100%;"
-                onClick={() => void guard(() => api.closeRoom(token))}
-              >
-                Cerrar la sala
-              </button>
-            </section>
-          ) : null}
         </aside>
+
+        {dragging ? (
+          <div class="drop-veil" aria-hidden="true">
+            <Icon name="download" />
+            <span>Suelta para subirlo a la sala</span>
+          </div>
+        ) : null}
       </div>
+
+      <footer class="room-foot">
+        <span class={`status-dot${state.status === "online" ? "" : " offline"}`}>
+          {state.status === "online" ? "conectado" : "reconectando"}
+        </span>
+        <span class={`clock${expiringSoon ? " urgent" : ""}`}>
+          se borra en {formatRemaining(remaining)} sin actividad
+          {justRenewed ? <span class="clock-renewed"> · reiniciado</span> : null}
+        </span>
+
+        <span class="room-bar-spacer" />
+
+        <span>
+          {formatBytes(state.draft)} ·{" "}
+          <span class={dirty ? "foot-dirty" : undefined}>{dirty ? "sin guardar" : "sincronizado"}</span>
+        </span>
+        <span class="tools-hint">Alt+C copiar · Alt+N nueva pegada · Alt+S descargar</span>
+      </footer>
+
+      {confirming ? (
+        <Modal title={confirming.title} onClose={() => setConfirming(null)}>
+          <p>{confirming.body}</p>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-secondary" onClick={() => setConfirming(null)}>
+              Cancelar
+            </button>
+            <button
+              type="button"
+              class="btn btn-danger"
+              onClick={() => {
+                confirming.run();
+                setConfirming(null);
+              }}
+            >
+              {confirming.label}
+            </button>
+          </div>
+        </Modal>
+      ) : null}
 
       {toast ? (
         <div class="toast" role="status">

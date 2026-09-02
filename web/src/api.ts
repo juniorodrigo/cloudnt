@@ -92,6 +92,8 @@ export const putText = (token: string, text: string, baseRev: number, force = fa
 const post = <T>(path: string, token: string, body?: unknown) =>
   request<T>(path, { method: "POST", token, body: body ? JSON.stringify(body) : undefined });
 
+export const pinText = (token: string) => post("/api/pin", token);
+export const removeEntry = (token: string, id: number) => post("/api/entry/remove", token, { id });
 export const clearRoom = (token: string) => post<{ rev: number }>("/api/clear", token);
 export const keepAlive = (token: string) => post<{ ok: true }>("/api/keepalive", token);
 export const approve = (token: string, pendingId: string) => post("/api/approve", token, { pendingId });

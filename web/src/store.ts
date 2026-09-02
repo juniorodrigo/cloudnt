@@ -6,6 +6,7 @@ export type SavedRoom = {
 };
 
 const KEY = "cloudnt:rooms";
+const WIDTH_KEY = "cloudnt:stack-width";
 const MAX = 8;
 
 function read(): SavedRoom[] {
@@ -36,6 +37,19 @@ export function remember(room: SavedRoom): void {
 
 export function forget(token: string): void {
   write(read().filter((r) => r.token !== token));
+}
+
+export function savedStackWidth(): number | null {
+  const value = Number(localStorage.getItem(WIDTH_KEY));
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+export function saveStackWidth(width: number): void {
+  try {
+    localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
+  } catch {
+    // private mode or quota exceeded: the panel just goes back to its default width
+  }
 }
 
 /** The code rotates without invalidating tokens: the saved entry must be updated. */

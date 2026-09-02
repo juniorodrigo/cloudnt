@@ -368,6 +368,17 @@ export function setAutoApprove(room: RoomRow, minutes: number): number {
 // ── text ─────────────────────────────────────────────────────────────────────
 
 /**
+ * Restoring an entry into the editor and then pasting over it would otherwise
+ * snapshot content that is already on the list.
+ */
+function alreadyPinned(roomId: string, content: string): boolean {
+  return (
+    db.query("SELECT 1 FROM history WHERE room_id = ? AND content = ? LIMIT 1").get(roomId, content) !==
+    null
+  );
+}
+
+/**
  * Saves the previous text to history only when it was replaced from scratch —
  * pasting over it or clearing it. Incremental typing preserves the prefix, so
  * it does not pollute the ten slots with intermediate states.
@@ -377,10 +388,7 @@ function snapshotIfReplaced(roomId: string, previous: string, next: string): boo
   const anchor = previous.slice(0, Math.min(24, previous.length));
   if (next.includes(anchor)) return false;
 
-  const last = db
-    .query("SELECT content FROM history WHERE room_id = ? ORDER BY id DESC LIMIT 1")
-    .get(roomId) as { content: string } | null;
-  if (last?.content === previous) return false;
+  if (alreadyPinned(roomId, previous)) return false;
 
   db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
     roomId,
@@ -429,6 +437,40 @@ export function setText(
   }
   touch(room);
   return { ok: true, rev };
+}
+
+/**
+ * Pins the live text as an entry of its own. The automatic snapshot only fires
+ * when a paste replaces the previous one, so without this there is no way to
+ * keep two texts side by side without overwriting one of them first.
+ */
+export function pinText(room: RoomRow): boolean {
+  const current = db.query("SELECT text FROM rooms WHERE id = ?").get(room.id) as { text: string };
+  if (current.text.trim() === "") return false;
+
+  if (alreadyPinned(room.id, current.text)) return false;
+
+  db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
+    room.id,
+    current.text,
+    Date.now(),
+  ]);
+  db.run(
+    `DELETE FROM history WHERE room_id = ?1 AND id NOT IN
+       (SELECT id FROM history WHERE room_id = ?1 ORDER BY id DESC LIMIT ?2)`,
+    [room.id, LIMITS.historyEntries],
+  );
+  bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
+  touch(room);
+  return true;
+}
+
+export function removeEntry(room: RoomRow, id: number): boolean {
+  const result = db.run("DELETE FROM history WHERE room_id = ? AND id = ?", [room.id, id]);
+  if (result.changes === 0) return false;
+  bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
+  touch(room);
+  return true;
 }
 
 /** The only immediate and irreversible deletion: the emergency exit. */

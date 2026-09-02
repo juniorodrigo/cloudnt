@@ -1,3 +1,5 @@
+import { Logo } from "./Logo.tsx";
+
 type Props = {
   code: string;
   fingerprint: string;
@@ -13,7 +15,7 @@ type Props = {
 export function Waiting({ code, fingerprint, rejected, onBack }: Props) {
   return (
     <div class="waiting">
-      <span class="wordmark">cloudnt</span>
+      <Logo />
 
       {rejected ? (
         <>
