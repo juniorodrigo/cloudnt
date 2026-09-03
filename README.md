@@ -30,6 +30,9 @@ La especificación completa está en [cloudnt-spec.md](cloudnt-spec.md).
 [Bun](https://bun.sh) 1.4 o superior. Nada más: SQLite viene dentro de Bun y no hay
 dependencias de sistema.
 
+Para trabajar en el código, sigue con [Desarrollo](#desarrollo). Para ponerlo en un
+servidor, salta a [Despliegue](#despliegue).
+
 ## Desarrollo
 
 ```sh
@@ -52,9 +55,160 @@ que no sea de API, a propósito, para que no haya duda de quién está sirviendo
 | `bun run start` | producción: sirve API y cliente desde un solo proceso |
 | `bun run typecheck` | `tsc --noEmit` |
 
+## Despliegue
+
+Cuatro pasos, en orden, sobre Debian 13 o Ubuntu 24.04 y como `root`. Los tres
+primeros dejan la aplicación corriendo; el cuarto no da recetas, solo dice qué
+necesita el servidor de lo que decidas poner delante.
+
+Antes de empezar, mira [Dimensionar](#dimensionar) si vas a abrirlo al público.
+
+### 1. Crear el usuario e instalar Bun
+
+```sh
+adduser --system --group --home /opt/cloudnt cloudnt
+apt update && apt install -y git unzip
+sudo -u cloudnt bash -c 'curl -fsSL https://bun.sh/install | bash'
+```
+
+Bun queda en `/opt/cloudnt/.bun/bin/bun`.
+
+### 2. Clonar y compilar
+
+```sh
+git clone <url-del-repo> /opt/cloudnt/app
+chown -R cloudnt:cloudnt /opt/cloudnt/app
+sudo -u cloudnt bash -c 'cd /opt/cloudnt/app && /opt/cloudnt/.bun/bin/bun install && /opt/cloudnt/.bun/bin/bun run build'
+```
+
+Si clonas en otra ruta, cámbiala en los tres comandos de arriba y en el
+`WorkingDirectory` del paso 3.
+
+La ruta a `bun` va completa porque `cloudnt` es un usuario de sistema sin shell:
+su `PATH` no incluye `~/.bun/bin`. Y se despliega el árbol del repo entero, no un
+artefacto suelto, porque el servidor busca el cliente en `web/dist/` relativo a
+`server/index.ts`.
+
+### 3. Crear el servicio
+
+Crea el archivo `/etc/systemd/system/cloudnt.service` — no existe todavía — con
+este contenido:
+
+```ini
+[Unit]
+Description=cloudnt
+After=network.target
+
+[Service]
+Type=simple
+User=cloudnt
+Group=cloudnt
+# La ruta donde clonaste en el paso 2. Si no coincide, systemd falla con
+# status=200/CHDIR antes siquiera de arrancar Bun.
+WorkingDirectory=/opt/cloudnt/app
+ExecStart=/opt/cloudnt/.bun/bin/bun run server/index.ts
+Restart=always
+RestartSec=2
+
+# Sin esto el servidor devuelve 404 en todo lo que no sea /api, a propósito.
+Environment=NODE_ENV=production
+# Por defecto son 3000. Si lo cambias, cámbialo también en lo que pongas delante.
+Environment=PORT=3067
+# Solo si pones algo delante: ver el paso 4, que es donde se decide la cabecera.
+# Sin nada delante, borra estas dos líneas.
+Environment=CLOUDNT_TRUST_PROXY=1
+Environment=CLOUDNT_CLIENT_IP_HEADER=x-forwarded-for
+# Ajústalo a tu disco: aquí son 20 GB.
+Environment=CLOUDNT_DISK_BYTES=21474836480
+Environment=CLOUDNT_DATA=/var/lib/cloudnt
+
+# Un descriptor por conexión. Con los 1024 de serie el techo real son ~900 clientes.
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Crea /var/lib/cloudnt con el dueño correcto, que es lo que hace compatible
+# ProtectSystem=strict con que la aplicación escriba.
+StateDirectory=cloudnt
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Arráncalo y comprueba que responde:
+
+```sh
+systemctl daemon-reload && systemctl enable --now cloudnt
+curl -sI http://127.0.0.1:3067/   # 200 OK
+journalctl -u cloudnt -n 30
+```
+
+En este punto la aplicación funciona, escuchando solo en loopback. Publicarla es el
+paso 4.
+
+### 4. Exponerlo
+
+Cómo la publicas es decisión tuya: proxy inverso, túnel, o abrir el puerto si la
+máquina tiene IP pública. El servidor solo pide dos cosas de lo que pongas delante.
+
+**Que le diga la IP real del cliente.** Detrás de cualquier intermediario todas las
+peticiones llegan desde `127.0.0.1`, y las cuotas por IP se colapsan en un único cubo
+compartido por todo internet: 10 salas por hora en total. Para eso están
+`CLOUDNT_TRUST_PROXY=1` y `CLOUDNT_CLIENT_IP_HEADER` en la unit.
+
+Pon en la segunda la cabecera que escriba tu intermediario, y comprueba que la
+**sobrescribe** en lugar de añadirse. El servidor lee el último elemento de la cadena,
+así que una cabecera a la que el cliente pueda anteponer su propio valor deja las
+cuotas en nada: basta un valor nuevo por petición para probar códigos sin límite. Con
+Cloudflare delante la que cumple eso es `cf-connecting-ip`, no `x-forwarded-for`.
+
+Si no hay nada delante, **quita esas dos líneas de la unit**. Sin proxy la cabecera la
+controla quien llama.
+
+**Que no estorbe a las conexiones largas.** El resto ya está resuelto en el código: el
+latido del WebSocket va cada 25 s, por debajo del corte de inactividad habitual de
+100 s; el canal SSE de respaldo viaja con `cache-control: no-transform` y
+`x-accel-buffering: no`, que es lo que impide que un proxy lo retenga en un búfer; y
+ningún trozo de subida pasa de 5 MB, por debajo del tope de tamaño de petición de
+cualquier CDN.
+
+### Dimensionar
+
+| | Uso personal o de equipo | Público, con margen |
+|---|---|---|
+| vCPU | 1 | 2 |
+| RAM | 1 GB | 2 GB |
+| Disco | 40 GB | 80 GB |
+| `CLOUDNT_DISK_BYTES` | 20 GB | 50 GB |
+
+El trabajo es todo E/S, así que la CPU casi nunca es el límite. El techo del código son
+**8 000 clientes** (500 salas × 16), y hasta ahí los cuellos de botella aparecen en
+este orden: descriptores de fichero, RAM, escrituras a SQLite, y en la práctica el
+ancho de banda antes que ninguno.
+
+El disco no se calcula con los límites por sala, porque esos se multiplican: 500 salas
+de 5 GB son 2,5 TB. Manda `CLOUDNT_DISK_BYTES`, que es un tope duro sobre todo lo
+almacenado a la vez. Ponlo por debajo del disco real y olvídate.
+
+### Las descargas son el punto débil
+
+Los archivos se sirven desde el propio proceso, así que cada byte descargado sale por
+la subida de la máquina. En una conexión doméstica eso es una fracción de la bajada: un
+archivo de 1 GB la satura durante minutos. Y si delante hay un CDN, los planes
+gratuitos suelen reservarse para contenido principalmente HTML y desaconsejar por
+contrato servir archivos grandes — una aplicación de transferencia con tope de 1 GB por
+archivo es exactamente el caso al que apuntan esas cláusulas.
+
+Ambos se arreglan igual: sacar los archivos a almacenamiento S3 y servirlos con URL
+firmada, de modo que los bytes no pasen ni por tu línea ni por el CDN. Mientras eso no
+esté, baja `fileBytes` en `server/config.ts` a algo que tu subida tolere.
+
 ## Configuración
 
-Todo por variables de entorno, todo con un valor por defecto sensato.
+Referencia de las variables de entorno. Todas tienen un valor por defecto sensato, y
+la unit del paso 3 ya trae puestas las que importan en producción.
 
 | Variable | Por defecto | Para qué |
 |---|---|---|
@@ -67,18 +221,13 @@ Todo por variables de entorno, todo con un valor por defecto sensato.
 | `CLOUDNT_CLIENT_IP_HEADER` | `x-forwarded-for` | qué cabecera trae la IP del cliente |
 | `CLOUDNT_DISK_BYTES` | `20 GB` | tope global de disco |
 
-`CLOUDNT_TRUST_PROXY` merece cuidado. Sin proxy delante la cabecera la controla quien
-llama, y entonces toda cuota por IP deja de existir: basta un valor nuevo por petición
-para probar códigos sin límite. Actívala solo cuando haya un proxy que la escriba.
+`CLOUDNT_TRUST_PROXY=1` solo va cuando hay de verdad un proxy delante que escriba esa
+cabecera. Sin proxy la controla quien llama, y toda cuota por IP deja de existir: basta
+un valor nuevo por petición para probar códigos sin límite.
 
-Detrás de Cloudflare, pon además `CLOUDNT_CLIENT_IP_HEADER=cf-connecting-ip`. El
-motivo está más abajo, y no es opcional.
-
-`CLOUDNT_DISK_BYTES` es el único tope que mira el disco entero. Los límites de abajo
-son por sala y se multiplican en lugar de acumularse, así que sin él el techo teórico
-son 2,5 TB. Ajústalo al disco de la máquina dejando margen: la cuenta reserva el
-tamaño **declarado** de cada archivo desde que se anuncia, no el que ha llegado, para
-que varias subidas simultáneas no atraviesen el mismo hueco libre.
+`CLOUDNT_DISK_BYTES` cuenta el tamaño **declarado** de cada archivo desde que se
+anuncia, no el que ha llegado, para que varias subidas simultáneas no atraviesen el
+mismo hueco libre. Déjale margen sobre el disco real.
 
 Los límites de abuso viven en [`server/config.ts`](server/config.ts) y no son
 configurables por entorno: son decisiones de diseño, no de despliegue.
@@ -96,178 +245,13 @@ configurables por entorno: son decisiones de diseño, no de despliegue.
 | archivos por sala | 20 |
 
 El almacenamiento es un presupuesto único: el texto del editor, las pegadas y los
-archivos comparten el mismo gigabyte. El pie de la sala lo muestra como
-porcentaje, y al llegar al 100 % la sala pasa a sólo lectura — se puede seguir
-leyendo y descargando, pero nada nuevo entra hasta que se borre algo. Encogerse
-siempre se permite, o el límite bloquearía la salida del límite.
+archivos comparten el mismo gigabyte. El pie de la sala lo muestra como porcentaje, y
+al llegar al 100 % la sala pasa a sólo lectura — se puede seguir leyendo y descargando,
+pero nada nuevo entra hasta que se borre algo. Encogerse siempre se permite, o el
+límite bloquearía la salida del límite.
 
-El tráfico va aparte, porque cuenta bytes movidos y no ocupados: un archivo
-descargado diez veces sigue ocupando su tamaño una sola vez.
-
-## Despliegue
-
-Sirve igual para una VM con IP pública que para una máquina en casa detrás de un
-router: el túnel de la sección correspondiente resuelve el segundo caso.
-
-### Dimensionar
-
-El techo del código son **8 000 clientes** (500 salas × 16). Para llegar ahí el orden
-en que aparecen los cuellos de botella es: descriptores de fichero (uno por conexión,
-y `ulimit -n` son 1 024 por defecto), luego RAM, luego escrituras a SQLite, y en la
-práctica el ancho de banda antes que ninguno.
-
-El disco no se dimensiona por los límites por sala, porque esos se multiplican: 500
-salas de 5 GB son 2,5 TB. Lo que manda es `CLOUDNT_DISK_BYTES`, que es un tope duro
-sobre todo lo almacenado a la vez. Ponlo por debajo del disco real y olvídate.
-
-| | Uso personal o de equipo | Público, con margen |
-|---|---|---|
-| vCPU | 1 | 2 |
-| RAM | 1 GB | 2 GB |
-| Disco | 40 GB | 80 GB |
-| `CLOUDNT_DISK_BYTES` | 20 GB | 50 GB |
-
-El trabajo es todo E/S, así que la CPU casi nunca es el límite.
-
-### Instalar
-
-Debian 13 o Ubuntu 24.04. Como `root`:
-
-```sh
-adduser --system --group --home /opt/cloudnt cloudnt
-apt update && apt install -y git unzip
-sudo -u cloudnt bash -c 'curl -fsSL https://bun.sh/install | bash'
-```
-
-Bun queda en `/opt/cloudnt/.bun/bin/bun`.
-
-```sh
-git clone <url-del-repo> /opt/cloudnt/app
-chown -R cloudnt:cloudnt /opt/cloudnt/app
-sudo -u cloudnt bash -c 'cd /opt/cloudnt/app && /opt/cloudnt/.bun/bin/bun install && /opt/cloudnt/.bun/bin/bun run build'
-```
-
-La ruta va completa a propósito: `cloudnt` es un usuario de sistema sin shell de
-acceso, así que su `PATH` no incluye `~/.bun/bin`.
-
-El servidor busca el cliente en `../web/dist/` relativo a `server/index.ts`, así que
-hay que desplegar el árbol del repo entero, no solo un artefacto suelto.
-
-### systemd
-
-`/etc/systemd/system/cloudnt.service`:
-
-```ini
-[Unit]
-Description=cloudnt
-After=network.target
-
-[Service]
-Type=simple
-User=cloudnt
-Group=cloudnt
-WorkingDirectory=/opt/cloudnt/app
-Environment=NODE_ENV=production
-Environment=CLOUDNT_DATA=/var/lib/cloudnt
-Environment=CLOUDNT_DISK_BYTES=21474836480
-Environment=CLOUDNT_TRUST_PROXY=1
-Environment=CLOUDNT_CLIENT_IP_HEADER=cf-connecting-ip
-ExecStart=/opt/cloudnt/.bun/bin/bun run server/index.ts
-Restart=always
-RestartSec=2
-
-# Un descriptor por conexión. Con los 1024 de serie el techo real son ~900 clientes.
-LimitNOFILE=65535
-
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-StateDirectory=cloudnt
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`StateDirectory=cloudnt` crea `/var/lib/cloudnt` con el dueño correcto, que es lo que
-hace compatible `ProtectSystem=strict` con que la aplicación escriba.
-
-```sh
-systemctl daemon-reload && systemctl enable --now cloudnt
-```
-
-### Exponerlo con Cloudflare Tunnel
-
-Pensado para una máquina sin IP pública, detrás del router de casa. `cloudflared` abre
-una conexión **saliente** hacia Cloudflare y el tráfico entra por ahí: no hay puertos
-que abrir, ni redirección en el router, ni certificado que renovar, y la IP doméstica
-no aparece en ningún DNS.
-
-```sh
-curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-  -o /usr/share/keyrings/cloudflare-main.gpg
-echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
-  > /etc/apt/sources.list.d/cloudflared.list
-apt update && apt install -y cloudflared
-```
-
-```sh
-cloudflared tunnel login          # autoriza cloudnt.org en el navegador
-cloudflared tunnel create cloudnt # imprime el UUID y deja el JSON de credenciales
-```
-
-`/etc/cloudflared/config.yml`:
-
-```yaml
-tunnel: <UUID>
-credentials-file: /etc/cloudflared/<UUID>.json
-ingress:
-  - hostname: cloudnt.org
-    service: http://127.0.0.1:3000
-  - service: http_status:404
-```
-
-```sh
-cloudflared tunnel route dns cloudnt cloudnt.org   # crea el CNAME
-cloudflared service install
-systemctl enable --now cloudflared
-```
-
-El firewall entrante puede quedarse cerrado del todo:
-
-```sh
-ufw default deny incoming && ufw allow 22/tcp && ufw enable
-```
-
-### Lo que el túnel cambia para esta aplicación
-
-**La IP del cliente es lo único que hay que configurar a mano.** Cloudflare escribe
-`CF-Connecting-IP` en cada petición y siempre la sobrescribe, mientras que a
-`X-Forwarded-For` se limita a añadirse: si quien llama manda su propio
-`X-Forwarded-For`, ese valor sobrevive dentro de la cadena. Como el servidor lee el
-último elemento, con `x-forwarded-for` dependerías de que ningún salto intermedio
-añada nada después — algo que ni Cloudflare ni `cloudflared` garantizan por escrito.
-Con `cf-connecting-ip` el valor entero lo pone el edge y la cuestión desaparece. De
-ahí que la unit lleve `CLOUDNT_CLIENT_IP_HEADER=cf-connecting-ip`: sin eso, las cuotas
-por IP se apoyan en una suposición.
-
-**Lo demás ya está resuelto en el código.** El túnel pasa WebSocket sin configurar
-nada. Cloudflare corta las conexiones HTTP inactivas a los 100 s, y el latido va cada
-25 s. El canal SSE de respaldo ya viaja con `cache-control: no-transform` y
-`x-accel-buffering: no`, que es justo lo que impide que el edge lo retenga. El plan
-gratuito rechaza peticiones de más de 100 MB, y ningún trozo pasa de 5 MB.
-
-**Las descargas son el problema, y son dos.** El primero es tu línea: cada byte que
-alguien se descarga sale por la subida de tu conexión doméstica, que en fibra suele
-ser una fracción de la bajada. Un archivo de 1 GB satura eso durante minutos. El
-segundo es el contrato: la sección 2.8 de los términos de Cloudflare reserva el plan
-gratuito para contenido principalmente HTML y desaconseja usarlo para servir archivos
-grandes. Una aplicación de transferencia con un tope de 1 GB por archivo es
-precisamente el caso al que apunta esa cláusula.
-
-Las dos se arreglan igual: sacar los archivos a almacenamiento S3 y servirlos con URL
-firmada, de modo que los bytes nunca pasen por tu casa ni por el CDN. Mientras eso no
-esté, baja `fileBytes` en `server/config.ts` a algo que tu subida tolere.
+El tráfico va aparte, porque cuenta bytes movidos y no ocupados: un archivo descargado
+diez veces sigue ocupando su tamaño una sola vez.
 
 ## Operación
 
@@ -292,7 +276,6 @@ descarga (30 s de vida) y las ventanas de rate limit.
 ```sh
 journalctl -u cloudnt -f
 du -sh /var/lib/cloudnt/files
-journalctl -u cloudflared -f
 ```
 
 Si ese `du` se acerca a `CLOUDNT_DISK_BYTES`, las subidas empiezan a responder `507` y
