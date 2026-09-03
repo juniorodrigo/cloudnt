@@ -17,12 +17,13 @@ La especificación completa está en [cloudnt-spec.md](cloudnt-spec.md).
 - **El dueño aprueba.** Quien entra con el código espera; el dueño ve una huella
   corta del visitante y decide. Tras tres rechazos de huellas distintas el código
   rota solo.
-- **Texto e historial.** Sincronización con detección de conflicto por revisión y las
-  últimas 10 pegadas guardadas.
+- **Texto e historial.** Editor con formato (negrita, cursiva, tachado, listas) e
+  imágenes incrustadas. Sincronización con detección de conflicto por revisión y las
+  pegadas guardadas sin tope: caben las que quepan en el gigabyte de la sala.
 - **Archivos.** Subida por trozos de 5 MB, reanudable: si la conexión se corta, el
   cliente pregunta qué llegó y sigue desde ahí.
 - **Sin assets externos.** Ni fuentes web ni paquetes de iconos. La primera carga son
-  22 kB brotli.
+  38 kB brotli.
 
 ## Requisitos
 

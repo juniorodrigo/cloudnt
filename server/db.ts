@@ -90,7 +90,8 @@ export type MemberRow = {
   joined_at: number;
 };
 
-export type HistoryRow = { id: number; content: string; created_at: number };
+/** What the client gets: the body itself is fetched on demand, one entry at a time. */
+export type HistoryItem = { id: number; created_at: number; bytes: number; preview: string };
 
 export type FileRow = {
   id: string;

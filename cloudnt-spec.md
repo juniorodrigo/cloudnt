@@ -325,8 +325,8 @@ con red pésima, donde cada kilobyte de más es otro round-trip sobre un enlace
 que pierde paquetes. Preact + Vite ahorra unos 30 KB comprimidos frente a React,
 y esa diferencia se nota al cargar.
 
-**Presupuesto de carga: 30 KB brotli en total**, sumando HTML, JS y CSS de la
-primera carga. Es un techo, no una meta: hoy la app va por ~18 KB. La cifra que
+**Presupuesto de carga: 40 KB brotli en total**, sumando HTML, JS y CSS de la
+primera carga. Es un techo, no una meta: hoy la app va por ~38 KB. La cifra que
 importa es lo que viaja por el cable en la primera visita, no el tamaño de un
 chunk suelto ni el de una dependencia concreta, así que gastar el margen en CSS
 de diseño o en una pantalla más está bien mientras el total no se acerque al
@@ -334,6 +334,13 @@ techo. Lo caro no es el peso, es el número de viajes: la app debe seguir
 cargando en una sola tanda de peticiones, sin fuentes ni chunks diferidos en el
 camino crítico. Cuando el techo estorbe de verdad, se sube aquí y se justifica;
 lo que no se hace es superarlo en silencio.
+
+El techo era de 30 KB hasta que el editor pasó a ser rich-text. Pegar una imagen
+dentro del texto obliga a renderizar marcado escrito por otro miembro de la sala,
+y eso convierte el editor en la única superficie XSS del producto. DOMPurify son
+~11 KB brotli y es la respuesta madura a ese problema; escribir el saneador a
+mano habría salido más barato en bytes y mucho más caro en riesgo. Sigue siendo
+una sola tanda de peticiones.
 
 **Cero CDNs y cero fuentes externas.** Todo inline, stack de fuentes del
 sistema. Si la VM no tiene salida a internet pero sí alcanza al servidor, la app

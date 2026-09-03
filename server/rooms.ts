@@ -1,4 +1,4 @@
-import { db, type HistoryRow, type MemberRow, type RoomRow } from "./db.ts";
+import { db, type HistoryItem, type MemberRow, type RoomRow } from "./db.ts";
 import * as bus from "./bus.ts";
 import * as files from "./files.ts";
 import * as usage from "./usage.ts";
@@ -6,6 +6,7 @@ import { makeFingerprint } from "./fingerprint.ts";
 import {
   CODE_ALPHABET,
   CODE_LENGTH,
+  HISTORY_PREVIEW_CHARS,
   LIMITS,
   PENDING_TTL_MS,
   REJECT_UNDO_MS,
@@ -126,10 +127,25 @@ export function membersOf(roomId: string): MemberRow[] {
     .all(roomId) as MemberRow[];
 }
 
-export function historyOf(roomId: string): HistoryRow[] {
+/**
+ * The list is unbounded now, so the entries travel as previews: shipping every
+ * full body would put the whole room's text on the wire again on each change,
+ * and on the initial snapshot of every member who joins.
+ */
+export function historyOf(roomId: string): HistoryItem[] {
   return db
-    .query("SELECT id, content, created_at FROM history WHERE room_id = ? ORDER BY id DESC LIMIT ?")
-    .all(roomId, LIMITS.historyEntries) as HistoryRow[];
+    .query(
+      `SELECT id, created_at, LENGTH(CAST(content AS BLOB)) AS bytes, SUBSTR(content, 1, ?) AS preview
+         FROM history WHERE room_id = ? ORDER BY id DESC`,
+    )
+    .all(HISTORY_PREVIEW_CHARS, roomId) as HistoryItem[];
+}
+
+export function historyContent(roomId: string, id: number): string | null {
+  const row = db.query("SELECT content FROM history WHERE room_id = ? AND id = ?").get(roomId, id) as
+    | { content: string }
+    | null;
+  return row?.content ?? null;
 }
 
 export function pendingsOf(roomId: string): Pending[] {
@@ -380,28 +396,43 @@ function alreadyPinned(roomId: string, content: string): boolean {
 }
 
 /**
+ * Enough of a strip for the anchor below to work; the client is what renders
+ * this markup, and it sanitizes on the way in and on the way out. An image
+ * leaves its file id behind so a document made of images still anchors.
+ */
+const plainOf = (html: string) =>
+  html
+    .replace(/<[^>]*\bdata-file="([^"]*)"[^>]*>/g, " $1 ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+/**
  * The previous text goes to history only when it was replaced from scratch —
  * pasted over or cleared. Incremental typing preserves the prefix, so it does
- * not pollute the ten slots with intermediate states.
+ * not pollute the list with intermediate states. The comparison ignores tags:
+ * markup closes right after the first characters, so a raw prefix would stop
+ * matching on the very next keystroke.
  */
 function replacesText(roomId: string, previous: string, next: string): boolean {
-  if (previous.trim() === "") return false;
-  const anchor = previous.slice(0, Math.min(24, previous.length));
-  if (next.includes(anchor)) return false;
+  const before = plainOf(previous);
+  if (before === "") return false;
+  const anchor = before.slice(0, Math.min(24, before.length));
+  if (plainOf(next).includes(anchor)) return false;
   return !alreadyPinned(roomId, previous);
 }
 
+/**
+ * Nothing prunes the list: history counts against the room's storage quota like
+ * everything else, so it grows until the gigabyte runs out and the owner deletes
+ * what they no longer need.
+ */
 function pushHistory(roomId: string, content: string): void {
   db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
     roomId,
     content,
     Date.now(),
   ]);
-  db.run(
-    `DELETE FROM history WHERE room_id = ?1 AND id NOT IN
-       (SELECT id FROM history WHERE room_id = ?1 ORDER BY id DESC LIMIT ?2)`,
-    [roomId, LIMITS.historyEntries],
-  );
 }
 
 export function broadcastUsage(roomId: string): void {

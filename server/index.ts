@@ -346,6 +346,12 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
     return json({ id: file.id, name: file.name, chunkSize: file.chunk_size, chunks: file.chunks, received: [] });
   }
 
+  const entryMatch = path.match(/^\/api\/entry\/(\d+)$/);
+  if (entryMatch && req.method === "GET") {
+    const content = rooms.historyContent(room.id, Number(entryMatch[1]));
+    return content === null ? fail(404, M.notFound) : json({ content });
+  }
+
   const fileMatch = path.match(/^\/api\/file\/([^/]+)(\/.*)?$/);
   if (fileMatch) {
     const file = files.fileById(room.id, fileMatch[1]!);

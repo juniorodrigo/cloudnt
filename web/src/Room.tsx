@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useReducer, useRef, useState } from "preact/hooks";
 import * as api from "./api.ts";
 import {
   ApiError,
@@ -15,6 +15,7 @@ import { sendFile } from "./uploads.ts";
 import { Logo } from "./Logo.tsx";
 import { Icon } from "./icons.tsx";
 import { Menu, Modal } from "./ui.tsx";
+import { imageTag, isEmpty, sanitize, serialize, toPlain } from "./rich.ts";
 import { currentLang, setLang, strings, useT } from "./i18n.ts";
 import {
   copyText,
@@ -25,6 +26,34 @@ import {
   formatRemaining,
   formatSize,
 } from "./format.ts";
+
+/**
+ * Downloads answer application/octet-stream on purpose, and an <img> refuses to
+ * render that, so an embedded image is re-typed from its name. Only formats a
+ * browser paints are here: anything else stays a plain room file.
+ */
+const IMAGE_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+};
+
+const imageType = (name: string) => IMAGE_TYPES[name.split(".").pop()?.toLowerCase() ?? ""];
+
+/** The extension has to hold up on the other member's screen too, not just here. */
+const isImage = (file: File) => file.type.startsWith("image/") && imageType(file.name) !== undefined;
+
+/** Everything the sanitizer lets through and a keyboard cannot already reach. */
+const FORMATS = [
+  { command: "bold", key: "bold", label: "B" },
+  { command: "italic", key: "italic", label: "I" },
+  { command: "strikeThrough", key: "strike", label: "S" },
+  { command: "insertUnorderedList", key: "bullets", label: "•" },
+  { command: "insertOrderedList", key: "numbers", label: "1." },
+] as const;
 
 type State = {
   ready: boolean;
@@ -197,11 +226,15 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   const [dragging, setDragging] = useState(false);
   const [stackWidth, setStackWidth] = useState(() => clampStack(savedStackWidth() ?? STACK_DEFAULT));
   const [clearAfterPin, setClearAfterPin] = useState(clearsOnPin);
-  const editorRef = useRef<HTMLTextAreaElement>(null);
+  const editorRef = useRef<HTMLDivElement>(null);
+  /** What this tab last typed, so a remote update is told apart from an echo. */
+  const lastTyped = useRef("");
   const pickerRef = useRef<HTMLInputElement>(null);
   const resizeFrom = useRef<{ x: number; width: number } | null>(null);
   /** The picked File never leaves the tab: it is what a resume reads from. */
   const localFiles = useRef(new Map<string, File>());
+  /** Object URLs behind the embedded images, one per file id. */
+  const blobs = useRef(new Map<string, string>());
   const queue = useRef<Promise<unknown>>(Promise.resolve());
   const t = useT();
 
@@ -212,7 +245,17 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   const full = state.ready && limit > 0 && used >= limit;
   const remaining = state.expiresAt - now;
   const expiringSoon = state.ready && remaining < 10 * 60 * 1000;
+  const expiringNow = state.ready && remaining < 5 * 60 * 1000;
   const justRenewed = now - state.renewedAt < 1500;
+
+  /* The clock re-renders the list every second and the list has no cap, so the
+     previews are parsed once per change instead of once per tick. Each is a
+     prefix of the stored markup, cut mid-tag as often as not; DOMParser closes
+     what is dangling and the card shows text. */
+  const previews = useMemo(
+    () => new Map(state.history.map((item) => [item.id, toPlain(item.preview)])),
+    [state.history],
+  );
 
   const notify = (text: string, undo?: () => void) => {
     setToast({ text, undo });
@@ -222,6 +265,32 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
+  }, []);
+
+  /* app.tsx owns the title, but the last minutes have to be readable from a
+     background tab: that is where a room gets forgotten until it is gone. */
+  useEffect(() => {
+    if (!expiringNow) return;
+    document.title = `${formatRemaining(remaining)} · ${state.code}`;
+    return () => void (document.title = `${state.code} · cloudnt`);
+  }, [expiringNow, remaining, state.code]);
+
+  /* Repainting on every keystroke would drop the caret, so the editor is only
+     rewritten when the text did not come from this tab. */
+  useEffect(() => {
+    const el = editorRef.current;
+    if (!el || state.draft === lastTyped.current) return;
+    lastTyped.current = state.draft;
+    el.innerHTML = sanitize(state.draft);
+    paintImages();
+  }, [state.draft]);
+
+  useEffect(() => {
+    const urls = blobs.current;
+    return () => {
+      for (const url of urls.values()) URL.revokeObjectURL(url);
+      urls.clear();
+    };
   }, []);
 
   useEffect(() => {
@@ -309,7 +378,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
     }
     if (event.key === "s") {
       event.preventDefault();
-      downloadText(state.draft, `cloudnt-${state.code}.txt`);
+      downloadText(toPlain(state.draft), `cloudnt-${state.code}.txt`);
     }
     if (event.key === "n") {
       event.preventDefault();
@@ -330,13 +399,14 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   }, []);
 
   const handleCopy = async () => {
-    if (await copyText(state.draft)) return notify(t.room.copied);
-    editorRef.current?.select();
+    if (await copyText(toPlain(state.draft))) return notify(t.room.copied);
+    const el = editorRef.current;
+    if (el) getSelection()?.selectAllChildren(el);
     notify(t.room.noClipboardSelected);
   };
 
   const pinCurrent = async () => {
-    if (state.draft.trim() === "") return;
+    if (isEmpty(state.draft)) return;
     if (full) return notify(t.room.fullPin);
     await guard(async () => {
       // Pinning takes the server's copy, so the debounced write has to land
@@ -361,17 +431,22 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
     });
   };
 
-  const copyEntry = async (text: string) => {
-    notify((await copyText(text)) ? t.room.entryCopied : t.room.noClipboard);
-  };
+  const copyEntry = (id: number) =>
+    guard(async () => {
+      const { content } = await api.entryContent(token, id);
+      notify((await copyText(toPlain(content))) ? t.room.entryCopied : t.room.noClipboard);
+    });
 
   /** The old single-buffer behaviour, kept as one deliberate action. */
-  const copyAll = async () => {
-    const all = [state.draft, ...state.history.map((item) => item.content)]
-      .filter((text) => text.trim() !== "")
-      .join("\n\n");
-    notify((await copyText(all)) ? t.room.allCopied : t.room.noClipboard);
-  };
+  const copyAll = () =>
+    guard(async () => {
+      const bodies = await Promise.all(state.history.map((item) => api.entryContent(token, item.id)));
+      const all = [state.draft, ...bodies.map((body) => body.content)]
+        .map(toPlain)
+        .filter((text) => text !== "")
+        .join("\n\n");
+      notify((await copyText(all)) ? t.room.allCopied : t.room.noClipboard);
+    });
 
   const keepMine = async () => {
     if (!state.conflict) return;
@@ -420,7 +495,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
     });
   };
 
-  const addFiles = async (picked: FileList | null) => {
+  const addFiles = async (picked: Iterable<File> | null) => {
     if (full) return notify(t.room.fullUpload);
     for (const file of Array.from(picked ?? [])) {
       try {
@@ -430,6 +505,78 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
       } catch (error) {
         if (error instanceof ApiError) notify(t.room.uploadFailed(file.name, error.message));
       }
+    }
+  };
+
+  const blobFor = async (fileId: string, name: string): Promise<string | null> => {
+    const cached = blobs.current.get(fileId);
+    if (cached) return cached;
+    const type = imageType(name);
+    if (!type) return null;
+    // The uploader still has the bytes in hand; everyone else pays for a ticket.
+    let data: Blob | undefined = localFiles.current.get(fileId);
+    if (!data) {
+      const { ticket } = await api.downloadTicket(token, fileId);
+      const response = await fetch(`/api/download/${ticket}`);
+      if (!response.ok) return null;
+      data = await response.blob();
+    }
+    const url = URL.createObjectURL(new Blob([data], { type }));
+    blobs.current.set(fileId, url);
+    return url;
+  };
+
+  /** The document only ever names a file; the bytes are looked up here, once. */
+  const paintImages = () => {
+    const el = editorRef.current;
+    if (!el) return;
+    for (const img of el.querySelectorAll<HTMLImageElement>("img[data-file]:not([src])")) {
+      const id = img.dataset.file;
+      if (!id) continue;
+      void blobFor(id, img.alt)
+        .then((url) => {
+          if (url) img.setAttribute("src", url);
+        })
+        .catch(() => {});
+    }
+  };
+
+  const commitEditor = () => {
+    const el = editorRef.current;
+    if (!el) return;
+    const html = serialize(el);
+    lastTyped.current = html;
+    dispatch({ type: "draft", text: html });
+    paintImages();
+  };
+
+  const insertImages = async (picked: File[]) => {
+    if (full) return notify(t.room.fullUpload);
+    for (const file of picked) {
+      try {
+        const created = await api.createFile(token, file.name, file.size);
+        localFiles.current.set(created.id, file);
+        runUpload(created.id);
+        // execCommand is the only insertion that leaves the caret and the undo
+        // stack where the browser put them, and it needs the editor focused.
+        editorRef.current?.focus();
+        document.execCommand("insertHTML", false, imageTag(created.id, file.name));
+        commitEditor();
+      } catch (error) {
+        if (error instanceof ApiError) notify(t.room.uploadFailed(file.name, error.message));
+      }
+    }
+  };
+
+  /** In the editor an image joins the text; everywhere else it is a room file. */
+  const receive = (picked: File[], target: EventTarget | null) => {
+    const inEditor = editorRef.current?.contains(target as Node) ?? false;
+    const inline = inEditor ? picked.filter(isImage) : [];
+    const rest = picked.filter((file) => !inline.includes(file));
+    if (inline.length) void insertImages(inline);
+    if (rest.length) {
+      setTab("files");
+      void addFiles(rest);
     }
   };
 
@@ -482,7 +629,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
             type="button"
             class="btn btn-secondary btn-sm"
             data-tip={t.room.pinTip}
-            disabled={state.draft.trim() === "" || full}
+            disabled={isEmpty(state.draft) || full}
             onClick={() => void pinCurrent()}
           >
             <Icon name="pin" />
@@ -492,7 +639,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
             type="button"
             class="btn btn-secondary btn-sm"
             data-tip={t.room.downloadTip}
-            onClick={() => downloadText(state.draft, `cloudnt-${state.code}.txt`)}
+            onClick={() => downloadText(toPlain(state.draft), `cloudnt-${state.code}.txt`)}
           >
             <Icon name="download" />
             <span class="btn-label">{t.room.download}</span>
@@ -694,8 +841,8 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
       ) : null}
 
       {expiringSoon ? (
-        <div class="banner banner-warn" role="status">
-          <strong>{t.room.expiresIn(formatRemaining(remaining))}</strong>
+        <div class={`banner ${expiringNow ? "banner-error" : "banner-warn"}`} role={expiringNow ? "alert" : "status"}>
+          <strong>{expiringNow ? t.room.expiresNow(formatRemaining(remaining)) : t.room.expiresIn(formatRemaining(remaining))}</strong>
           <button type="button" class="btn btn-secondary btn-sm" onClick={() => void guard(() => api.keepAlive(token))}>
             {t.room.keepAlive}
           </button>
@@ -719,20 +866,49 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
           if (!event.dataTransfer?.files.length) return;
           event.preventDefault();
           setDragging(false);
-          setTab("files");
-          void addFiles(event.dataTransfer.files);
+          receive(Array.from(event.dataTransfer.files), event.target);
+        }}
+        // Screenshots arrive on the clipboard as files, so the paste that would
+        // otherwise drop nothing into the editor becomes an upload instead.
+        onPaste={(event) => {
+          if (!event.clipboardData?.files.length) return;
+          event.preventDefault();
+          receive(Array.from(event.clipboardData.files), event.target);
         }}
       >
         <div class="editor-pane">
-          <textarea
+          <div class="editor-tools" role="toolbar" aria-label={t.room.formatting}>
+            {FORMATS.map(({ command, key, label }) => (
+              <button
+                key={command}
+                type="button"
+                class="tool"
+                title={t.room[key]}
+                aria-label={t.room[key]}
+                // The editor loses focus on mousedown, and execCommand without a
+                // selection formats nothing.
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  editorRef.current?.focus();
+                  document.execCommand(command);
+                  commitEditor();
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div
             ref={editorRef}
             class="editor"
-            value={state.draft}
+            contentEditable
+            role="textbox"
+            aria-multiline="true"
             spellcheck={false}
-            autocomplete="off"
             aria-label={t.room.editorLabel}
-            placeholder={t.room.editorPlaceholder}
-            onInput={(event) => dispatch({ type: "draft", text: event.currentTarget.value })}
+            data-placeholder={t.room.editorPlaceholder}
+            data-empty={isEmpty(state.draft) ? "" : undefined}
+            onInput={commitEditor}
           />
         </div>
 
@@ -831,17 +1007,17 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
               ) : (
                 state.history.map((item) => (
                   <article key={item.id} class="entry">
-                    <pre class="entry-preview">{item.content.slice(0, 400)}</pre>
+                    <pre class="entry-preview">{previews.get(item.id)}</pre>
                     <div class="entry-foot">
                       <span class="entry-meta">
-                        {formatBytes(item.content)} · {formatAge(item.created_at)}
+                        {formatSize(item.bytes)} · {formatAge(item.created_at)}
                       </span>
                       <span class="room-bar-spacer" />
                       <button
                         type="button"
                         class="icon-btn"
                         title={t.room.copyEntry}
-                        onClick={() => void copyEntry(item.content)}
+                        onClick={() => void copyEntry(item.id)}
                       >
                         <Icon name="copy" />
                       </button>
@@ -849,7 +1025,12 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
                         type="button"
                         class="icon-btn"
                         title={t.room.restoreEntry}
-                        onClick={() => dispatch({ type: "draft", text: item.content })}
+                        onClick={() =>
+                          void guard(async () => {
+                            const { content } = await api.entryContent(token, item.id);
+                            dispatch({ type: "draft", text: content });
+                          })
+                        }
                       >
                         <Icon name="history" />
                       </button>

@@ -19,7 +19,8 @@ export type PendingRequest = {
   createdAt: number;
 };
 
-export type HistoryItem = { id: number; content: string; created_at: number };
+/** The body is fetched with entryContent() only when an action actually needs it. */
+export type HistoryItem = { id: number; created_at: number; bytes: number; preview: string };
 
 export type FileItem = {
   id: string;
@@ -102,6 +103,8 @@ const post = <T>(path: string, token: string, body?: unknown) =>
   request<T>(path, { method: "POST", token, body: body ? JSON.stringify(body) : undefined });
 
 export const pinText = (token: string) => post("/api/pin", token);
+export const entryContent = (token: string, id: number) =>
+  request<{ content: string }>(`/api/entry/${id}`, { token });
 export const removeEntry = (token: string, id: number) => post("/api/entry/remove", token, { id });
 export const clearRoom = (token: string) => post<{ rev: number }>("/api/clear", token);
 export const keepAlive = (token: string) => post<{ ok: true }>("/api/keepalive", token);

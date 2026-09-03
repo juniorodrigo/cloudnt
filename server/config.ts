@@ -60,12 +60,14 @@ export const DOWNLOAD_TICKET_TTL_MS = 30 * 1000;
  */
 export const DISK_BYTES = Number(Bun.env.CLOUDNT_DISK_BYTES ?? 20 * 1024 * 1024 * 1024);
 
+/** Matches what the entry card shows, so the wire never carries more than is read. */
+export const HISTORY_PREVIEW_CHARS = 400;
+
 export const LIMITS = {
   roomsPerIpPerHour: 10,
   joinAttemptsPerIpPer5Min: 20,
   concurrentRooms: 500,
   textBytesPerRoom: 8 * 1024 * 1024,
-  historyEntries: 10,
   membersPerRoom: 16,
   fileBytes: 1024 * 1024 * 1024,
   /**

@@ -1123,6 +1123,11 @@ button {
   background: var(--surface-1);
   color: var(--error);
 }
+/* Without this the shared `.banner strong` rule paints the headline white and
+   the last-minutes warning reads exactly like the ten-minute one. */
+.banner-error strong {
+  color: var(--error);
+}
 
 .room-body {
   position: relative;
@@ -1161,12 +1166,37 @@ button {
   min-height: 0;
 }
 
+.editor-tools {
+  display: flex;
+  gap: 2px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--hairline-soft);
+  background: var(--canvas);
+}
+
+.tool {
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-muted);
+  background: none;
+  cursor: pointer;
+}
+.tool:hover {
+  color: var(--ink);
+  background: var(--surface-2);
+}
+
 .editor {
   flex: 1;
   width: 100%;
+  min-height: 0;
+  overflow-y: auto;
   padding: 20px;
   border: none;
-  resize: none;
   font-family: var(--mono);
   font-size: 14px;
   line-height: 1.6;
@@ -1174,12 +1204,57 @@ button {
   color: var(--ink);
   background: var(--canvas);
   tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .editor:focus {
   outline: none;
 }
-.editor::placeholder {
+/* A contenteditable has no ::placeholder, and :empty is false as soon as the
+   browser drops its trailing <br>, hence the explicit empty marker. */
+.editor[data-empty]::before {
+  content: attr(data-placeholder);
   color: #5c5c5c;
+  pointer-events: none;
+}
+
+.editor p,
+.editor blockquote,
+.editor pre,
+.editor ul,
+.editor ol {
+  margin: 0 0 12px;
+}
+.editor li {
+  margin-left: 20px;
+}
+.editor blockquote {
+  padding-left: 12px;
+  border-left: 2px solid var(--hairline);
+  color: var(--ink-muted);
+}
+.editor code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface-2);
+}
+.editor a {
+  color: inherit;
+  text-decoration: underline;
+}
+.editor img {
+  display: block;
+  max-width: 100%;
+  margin: 8px 0;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+/* Until the blob resolves there is no src, and a broken image would collapse
+   the line it sits on. */
+.editor img:not([src]) {
+  width: 160px;
+  height: 90px;
+  background: var(--surface-2);
 }
 
 .drop-veil {

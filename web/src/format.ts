@@ -1,7 +1,12 @@
 import { strings } from "./i18n.ts";
 
+/**
+ * Every caller reads this as a duration inside a sentence, so it never returns a
+ * state. A room stays expired for up to a sweep before the server says so, and
+ * during that minute the countdown sits at zero.
+ */
 export function formatRemaining(ms: number): string {
-  if (ms <= 0) return strings().expired;
+  if (ms <= 0) return "0 s";
   const minutes = Math.floor(ms / 60000);
   if (minutes < 1) return `${Math.max(1, Math.floor(ms / 1000))} s`;
   if (minutes < 60) return `${minutes} min`;
