@@ -63,9 +63,17 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS files_room    ON files(room_id, created_at);
 `);
 
+const roomColumns = () =>
+  db.query("PRAGMA table_info(rooms)").all().map((c) => (c as { name: string }).name);
+
 /** Older databases predate per-room bandwidth accounting. */
-if (!db.query("PRAGMA table_info(rooms)").all().some((c) => (c as { name: string }).name === "bytes_moved")) {
+if (!roomColumns().includes("bytes_moved")) {
   db.exec("ALTER TABLE rooms ADD COLUMN bytes_moved INTEGER NOT NULL DEFAULT 0");
+}
+
+/** Older databases predate the editor knowing which entry it has open. */
+if (!roomColumns().includes("editing_id")) {
+  db.exec("ALTER TABLE rooms ADD COLUMN editing_id INTEGER");
 }
 
 export type RoomRow = {
@@ -77,6 +85,8 @@ export type RoomRow = {
   last_activity: number;
   auto_approve_until: number;
   bytes_moved: number;
+  /** The history entry the editor is working on, or null for a fresh draft. */
+  editing_id: number | null;
 };
 
 export type MemberRow = {

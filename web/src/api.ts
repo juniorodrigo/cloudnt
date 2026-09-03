@@ -44,6 +44,8 @@ export type Snapshot = {
   fingerprint: string;
   text: string;
   rev: number;
+  /** The history entry the editor has open, or null for a draft of its own. */
+  editingId: number | null;
   createdAt: number;
   lastActivity: number;
   expiresAt: number;
@@ -103,6 +105,9 @@ const post = <T>(path: string, token: string, body?: unknown) =>
   request<T>(path, { method: "POST", token, body: body ? JSON.stringify(body) : undefined });
 
 export const pinText = (token: string) => post("/api/pin", token);
+/** Opens an entry in the editor, or starts an empty draft with id null. */
+export const setEditing = (token: string, id: number | null, pin = false) =>
+  post<{ text: string; rev: number }>("/api/editing", token, { id, pin });
 export const entryContent = (token: string, id: number) =>
   request<{ content: string }>(`/api/entry/${id}`, { token });
 export const removeEntry = (token: string, id: number) => post("/api/entry/remove", token, { id });

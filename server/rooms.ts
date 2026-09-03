@@ -261,6 +261,7 @@ export function createRoom(ip: string, userAgent: string) {
     last_activity: now,
     auto_approve_until: 0,
     bytes_moved: 0,
+    editing_id: null,
   };
   db.run(
     "INSERT INTO rooms (id, code, text, rev, created_at, last_activity) VALUES (?, ?, '', 0, ?, ?)",
@@ -427,17 +428,33 @@ function replacesText(roomId: string, previous: string, next: string): boolean {
  * everything else, so it grows until the gigabyte runs out and the owner deletes
  * what they no longer need.
  */
-function pushHistory(roomId: string, content: string): void {
-  db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
+function pushHistory(roomId: string, content: string): number {
+  const result = db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
     roomId,
     content,
     Date.now(),
   ]);
+  return Number(result.lastInsertRowid);
 }
 
 export function broadcastUsage(roomId: string): void {
   bus.publish(roomTopic(roomId), { type: "usage", ...usage.roomUsage(roomId) });
 }
+
+/**
+ * Which entry the editor is working on. It is room state rather than per-tab
+ * because the editor is one shared buffer: a link private to a member would have
+ * everyone else typing into that member's entry without knowing.
+ */
+function linkEntry(roomId: string, id: number | null): void {
+  db.run("UPDATE rooms SET editing_id = ? WHERE id = ?", [id, roomId]);
+  bus.publish(roomTopic(roomId), { type: "editing", id });
+}
+
+type Editable = { text: string; rev: number; editing_id: number | null };
+
+const liveText = (roomId: string) =>
+  db.query("SELECT text, rev, editing_id FROM rooms WHERE id = ?").get(roomId) as Editable;
 
 export type SetTextResult =
   | { ok: true; rev: number }
@@ -454,33 +471,80 @@ export function setText(
   if (Buffer.byteLength(text, "utf8") > LIMITS.textBytesPerRoom) {
     return { ok: false, reason: "too_large" };
   }
-  const current = db.query("SELECT text, rev FROM rooms WHERE id = ?").get(room.id) as {
-    text: string;
-    rev: number;
-  };
+  const current = liveText(room.id);
   if (!force && baseRev !== current.rev) {
     return { ok: false, reason: "conflict", text: current.text, rev: current.rev };
   }
   if (text === current.text) return { ok: true, rev: current.rev };
 
+  const editing = current.editing_id;
+  // With an entry open the text is already on the list, so there is nothing to
+  // snapshot: the edit belongs to that entry and is written into it below.
+  const snapshots = editing === null && replacesText(room.id, current.text, text);
   // The old text only frees its bytes when it is overwritten outright; when it
-  // is kept as an entry the room pays for both at once.
-  const snapshots = replacesText(room.id, current.text, text);
-  const growth =
-    Buffer.byteLength(text, "utf8") - (snapshots ? 0 : Buffer.byteLength(current.text, "utf8"));
+  // is kept as an entry the room pays for both at once. An open entry holds the
+  // same bytes as the editor and is rewritten with it, so the change is paid
+  // for on both copies.
+  const before = snapshots ? 0 : Buffer.byteLength(current.text, "utf8");
+  const growth = (Buffer.byteLength(text, "utf8") - before) * (editing === null ? 1 : 2);
   if (!usage.fits(room.id, growth)) return { ok: false, reason: "full" };
 
   if (snapshots) pushHistory(room.id, current.text);
   const rev = current.rev + 1;
   db.run("UPDATE rooms SET text = ?, rev = ? WHERE id = ?", [text, rev, room.id]);
 
+  let listChanged = snapshots;
+  if (editing !== null) {
+    const written = db.run("UPDATE history SET content = ? WHERE room_id = ? AND id = ?", [
+      text,
+      room.id,
+      editing,
+    ]);
+    // Another member can delete the entry mid-edit. The text stays where it is;
+    // only the link goes, and the editor falls back to an unsaved draft.
+    if (written.changes === 0) linkEntry(room.id, null);
+    else listChanged = true;
+  }
+
   bus.publish(roomTopic(room.id), { type: "text", text, rev, authorId });
-  if (snapshots) {
+  if (listChanged) {
     bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
   }
   broadcastUsage(room.id);
   touch(room);
   return { ok: true, rev };
+}
+
+export type OpenResult = { ok: true; text: string; rev: number } | { ok: false; reason: "gone" | "full" };
+
+/**
+ * Loads a history entry into the editor, or starts an empty draft when id is
+ * null. Whatever the editor held is dropped unless `pin` asks for it to be kept:
+ * the choice belongs to the member and travels with the request so that saving
+ * and replacing cannot half-happen.
+ */
+export function openEntry(
+  room: RoomRow,
+  id: number | null,
+  pin: boolean,
+  authorId: string,
+): OpenResult {
+  if (pin && pinText(room) === "full") return { ok: false, reason: "full" };
+
+  const text = id === null ? "" : historyContent(room.id, id);
+  if (text === null) return { ok: false, reason: "gone" };
+
+  const current = liveText(room.id);
+  const growth = Buffer.byteLength(text, "utf8") - Buffer.byteLength(current.text, "utf8");
+  if (!usage.fits(room.id, growth)) return { ok: false, reason: "full" };
+
+  const rev = current.rev + 1;
+  db.run("UPDATE rooms SET text = ?, rev = ?, editing_id = ? WHERE id = ?", [text, rev, id, room.id]);
+  bus.publish(roomTopic(room.id), { type: "text", text, rev, authorId });
+  bus.publish(roomTopic(room.id), { type: "editing", id });
+  broadcastUsage(room.id);
+  touch(room);
+  return { ok: true, text, rev };
 }
 
 /**
@@ -497,7 +561,9 @@ export function pinText(room: RoomRow): "ok" | "nothing" | "full" {
   // costs a second copy of it.
   if (!usage.fits(room.id, Buffer.byteLength(current.text, "utf8"))) return "full";
 
-  pushHistory(room.id, current.text);
+  // The editor stays on the entry it just created. Leaving it on a loose draft
+  // would mean typing on drifts away from the entry meant to hold it.
+  linkEntry(room.id, pushHistory(room.id, current.text));
   bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
   broadcastUsage(room.id);
   touch(room);
@@ -507,6 +573,9 @@ export function pinText(room: RoomRow): "ok" | "nothing" | "full" {
 export function removeEntry(room: RoomRow, id: number): boolean {
   const result = db.run("DELETE FROM history WHERE room_id = ? AND id = ?", [room.id, id]);
   if (result.changes === 0) return false;
+  // Deleting the open entry leaves its text in the editor as an unsaved draft,
+  // which beats emptying the editor out from under whoever was typing.
+  if (liveText(room.id).editing_id === id) linkEntry(room.id, null);
   bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
   broadcastUsage(room.id);
   touch(room);
@@ -520,10 +589,11 @@ export function clearRoom(room: RoomRow, authorId: string): number {
     rev: number;
   };
   const rev = current.rev + 1;
-  db.run("UPDATE rooms SET text = '', rev = ? WHERE id = ?", [rev, room.id]);
+  db.run("UPDATE rooms SET text = '', rev = ?, editing_id = NULL WHERE id = ?", [rev, room.id]);
   db.run("DELETE FROM history WHERE room_id = ?", [room.id]);
 
   bus.publish(roomTopic(room.id), { type: "text", text: "", rev, authorId });
+  bus.publish(roomTopic(room.id), { type: "editing", id: null });
   bus.publish(roomTopic(room.id), { type: "history", items: [] });
   broadcastUsage(room.id);
   touch(room);
@@ -541,6 +611,7 @@ export function snapshot(room: RoomRow, member: MemberRow) {
     fingerprint: member.fingerprint,
     text: fresh.text,
     rev: fresh.rev,
+    editingId: fresh.editing_id,
     createdAt: fresh.created_at,
     lastActivity: fresh.last_activity,
     expiresAt: expiresAt(fresh),

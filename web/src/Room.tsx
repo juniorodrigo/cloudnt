@@ -63,6 +63,8 @@ type State = {
   serverText: string;
   serverRev: number;
   draft: string;
+  /** The history entry the editor is writing into, or null for a loose draft. */
+  editingId: number | null;
   conflict: { text: string; rev: number } | null;
   members: Member[];
   pending: PendingRequest[];
@@ -93,6 +95,7 @@ const initial: State = {
   serverText: "",
   serverRev: 0,
   draft: "",
+  editingId: null,
   conflict: null,
   members: [],
   pending: [],
@@ -117,6 +120,7 @@ function reducer(state: State, action: Action): State {
         code: snap.code,
         role: snap.role,
         memberId: snap.memberId,
+        editingId: snap.editingId,
         members: snap.members,
         pending: snap.pending,
         history: snap.history,
@@ -175,6 +179,8 @@ function reducer(state: State, action: Action): State {
           return { ...state, pending: e.pending as PendingRequest[] };
         case "history":
           return { ...state, history: e.items as HistoryItem[] };
+        case "editing":
+          return { ...state, editingId: e.id === null ? null : Number(e.id) };
         case "files":
           return { ...state, files: e.items as FileItem[] };
         case "usage":
@@ -205,6 +211,10 @@ type Confirmation = {
   body: string;
   label: string;
   run: () => void;
+  /** A second way out, offered between cancelling and the main action. */
+  alt?: { label: string; run: () => void };
+  /** The main action deletes something unless this says otherwise. */
+  safe?: boolean;
 };
 
 type Props = {
@@ -240,6 +250,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
 
   const isOwner = state.role === "owner";
   const dirty = isDirty(state);
+  const openEntry = state.history.find((item) => item.id === state.editingId);
   const { used, limit } = state.usage;
   const usedPercent = limit > 0 ? (used / limit) * 100 : 0;
   const full = state.ready && limit > 0 && used >= limit;
@@ -405,28 +416,55 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
     notify(t.room.noClipboardSelected);
   };
 
+  const applyOpen = (id: number | null, pin: boolean) =>
+    guard(async () => {
+      const { text, rev } = await api.setEditing(token, id, pin);
+      // Own echoes never touch the draft, so the tab that asked for the swap has
+      // to move its own editor.
+      dispatch({ type: "draft", text });
+      dispatch({ type: "commit", text, rev });
+      setTab("text");
+    });
+
+  /**
+   * Loads an entry into the editor, or empties it when id is null. Both replace
+   * whatever is there, so a draft that is not already on the list gets a say
+   * first: the decision travels with the request and is applied in one step.
+   */
+  const openDoc = (id: number | null) => {
+    const apply = (pin: boolean) => void applyOpen(id, pin);
+
+    // With an entry open the text is already saved into it, and an empty editor
+    // has nothing to lose either way.
+    if (state.editingId !== null || isEmpty(state.draft)) return apply(false);
+    setConfirming({
+      title: t.room.unsavedTitle,
+      body: t.room.unsavedBody,
+      label: t.room.saveAndOpen,
+      safe: true,
+      run: () => apply(true),
+      alt: { label: t.room.discardText, run: () => apply(false) },
+    });
+  };
+
   const pinCurrent = async () => {
-    if (isEmpty(state.draft)) return;
+    // With an entry open the text already has a home; pinning would only make a
+    // second copy of it.
+    if (isEmpty(state.draft) || state.editingId !== null) return;
     if (full) return notify(t.room.fullPin);
     await guard(async () => {
       // Pinning takes the server's copy, so the debounced write has to land
       // first or the entry misses the last keystrokes of a fresh paste.
-      let rev = state.serverRev;
       if (dirty) {
-        ({ rev } = await api.putText(token, state.draft, rev));
+        const { rev } = await api.putText(token, state.draft, state.serverRev);
         dispatch({ type: "commit", text: state.draft, rev });
       }
       await api.pinText(token);
-
-      if (clearAfterPin) {
-        // Committing the empty text as well as drafting it keeps the editor from
-        // looking unsaved and stops the debounce from writing the old text back.
-        const cleared = await api.putText(token, "", rev);
-        dispatch({ type: "draft", text: "" });
-        dispatch({ type: "commit", text: "", rev: cleared.rev });
-      }
-
       setTab("text");
+      // Pinning leaves the editor on the new entry, so clearing is the same swap
+      // as the New button. It skips the unsaved-text question on purpose: the
+      // text was just saved, whatever this tab still believes about the link.
+      if (clearAfterPin) await applyOpen(null, false);
       notify(clearAfterPin ? t.room.pinnedCleared : t.room.pinned);
     });
   };
@@ -619,6 +657,16 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
           <button
             type="button"
             class="btn btn-secondary btn-sm"
+            data-tip={t.room.newTip}
+            disabled={state.editingId === null && isEmpty(state.draft)}
+            onClick={() => openDoc(null)}
+          >
+            <Icon name="plus" />
+            <span class="btn-label">{t.room.new}</span>
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
             data-tip={t.room.copyTip}
             onClick={() => void handleCopy()}
           >
@@ -629,7 +677,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
             type="button"
             class="btn btn-secondary btn-sm"
             data-tip={t.room.pinTip}
-            disabled={isEmpty(state.draft) || full}
+            disabled={isEmpty(state.draft) || full || state.editingId !== null}
             onClick={() => void pinCurrent()}
           >
             <Icon name="pin" />
@@ -897,6 +945,27 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
                 {label}
               </button>
             ))}
+
+            <span class="room-bar-spacer" />
+
+            {/* Which document the editor holds, so that typing into a paste from
+                the list is never a surprise. */}
+            {openEntry ? (
+              <span class="doc doc-entry">
+                <Icon name="pin" />
+                {t.room.editingEntry(formatAge(openEntry.created_at))}
+                <button
+                  type="button"
+                  class="icon-btn"
+                  title={t.room.closeEntry}
+                  onClick={() => openDoc(null)}
+                >
+                  <Icon name="close" />
+                </button>
+              </span>
+            ) : (
+              <span class="doc">{t.room.draftDoc}</span>
+            )}
           </div>
           <div
             ref={editorRef}
@@ -1006,10 +1075,11 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
                 <p class="empty">{t.room.emptyPastes}</p>
               ) : (
                 state.history.map((item) => (
-                  <article key={item.id} class="entry">
+                  <article key={item.id} class={`entry${item.id === state.editingId ? " open" : ""}`}>
                     <pre class="entry-preview">{previews.get(item.id)}</pre>
                     <div class="entry-foot">
                       <span class="entry-meta">
+                        {item.id === state.editingId ? `${t.room.openTag} · ` : ""}
                         {formatSize(item.bytes)} · {formatAge(item.created_at)}
                       </span>
                       <span class="room-bar-spacer" />
@@ -1024,13 +1094,9 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
                       <button
                         type="button"
                         class="icon-btn"
-                        title={t.room.restoreEntry}
-                        onClick={() =>
-                          void guard(async () => {
-                            const { content } = await api.entryContent(token, item.id);
-                            dispatch({ type: "draft", text: content });
-                          })
-                        }
+                        title={t.room.openEntry}
+                        disabled={item.id === state.editingId}
+                        onClick={() => openDoc(item.id)}
                       >
                         <Icon name="history" />
                       </button>
@@ -1161,9 +1227,21 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
             <button type="button" class="btn btn-secondary" onClick={() => setConfirming(null)}>
               {t.room.cancel}
             </button>
+            {confirming.alt ? (
+              <button
+                type="button"
+                class="btn btn-danger"
+                onClick={() => {
+                  confirming.alt?.run();
+                  setConfirming(null);
+                }}
+              >
+                {confirming.alt.label}
+              </button>
+            ) : null}
             <button
               type="button"
-              class="btn btn-danger"
+              class={`btn ${confirming.safe ? "btn-primary" : "btn-danger"}`}
               onClick={() => {
                 confirming.run();
                 setConfirming(null);

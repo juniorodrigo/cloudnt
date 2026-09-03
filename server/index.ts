@@ -430,6 +430,13 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
       return result === "ok" ? json({ ok: true }) : fail(409, M.nothingToPin);
     }
 
+    case "/api/editing": {
+      if (body.id !== null && typeof body.id !== "number") return fail(400, M.badRequest);
+      const result = rooms.openEntry(room, body.id, body.pin === true, member.id);
+      if (result.ok) return json({ text: result.text, rev: result.rev });
+      return result.reason === "full" ? fail(413, M.full) : fail(404, M.notFound);
+    }
+
     case "/api/entry/remove": {
       if (typeof body.id !== "number") return fail(400, M.badRequest);
       return rooms.removeEntry(room, body.id) ? json({ ok: true }) : fail(404, M.notFound);

@@ -1168,10 +1168,30 @@ button {
 
 .editor-tools {
   display: flex;
+  align-items: center;
   gap: 2px;
   padding: 6px 16px;
   border-bottom: 1px solid var(--hairline-soft);
   background: var(--canvas);
+}
+
+/* Which document the editor holds. It sits in the toolbar because that is the
+   one strip a typing eye is already near. */
+.doc {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.doc-entry {
+  padding-left: 8px;
+  color: var(--accent-blue);
+  border-radius: 999px;
+}
+.doc svg {
+  width: 13px;
+  height: 13px;
 }
 
 .tool {
@@ -1466,6 +1486,11 @@ button {
   background: var(--surface-3);
   color: var(--ink);
 }
+.icon-btn:disabled {
+  opacity: 0.35;
+  background: none;
+  cursor: default;
+}
 .icon-btn .icon {
   width: 16px;
   height: 16px;
@@ -1547,6 +1572,12 @@ button {
 }
 .entry:hover {
   border-color: var(--hairline);
+}
+.entry.open {
+  border-color: var(--accent-blue);
+}
+.entry.open .entry-meta {
+  color: var(--accent-blue);
 }
 
 /* Four lines is enough to recognise a key or a stack trace; the whole point is
