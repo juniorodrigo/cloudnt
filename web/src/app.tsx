@@ -7,9 +7,9 @@ import { Room } from "./Room.tsx";
 import { connect } from "./transport.ts";
 import { forget, remember, tokenFor } from "./store.ts";
 import { Logo } from "./Logo.tsx";
+import { strings, useT } from "./i18n.ts";
 
 const CODE_RE = new RegExp(`^[${CODE_ALPHABET}]{${CODE_LENGTH}}$`);
-const LANDING_TITLE = "cloudnt · portapapeles compartido entre máquinas";
 
 type View =
   | { k: "home"; error?: string }
@@ -24,6 +24,7 @@ const codeFromPath = (): string | null => {
 
 export function App() {
   const [view, setView] = useState<View>({ k: "opening" });
+  const t = useT();
 
   const goHome = useCallback((error?: string) => {
     history.pushState(null, "", "/");
@@ -39,7 +40,7 @@ export function App() {
   const enter = useCallback(
     async (rawCode: string) => {
       const code = rawCode.toLowerCase();
-      if (!CODE_RE.test(code)) return setView({ k: "home", error: "Ese código no es válido." });
+      if (!CODE_RE.test(code)) return setView({ k: "home", error: strings().app.badCode });
 
       setView({ k: "opening" });
 
@@ -69,7 +70,7 @@ export function App() {
       } catch (error) {
         setView({
           k: "home",
-          error: error instanceof ApiError ? error.message : "No se pudo contactar con el servidor.",
+          error: error instanceof ApiError ? error.message : strings().app.noServer,
         });
       }
     },
@@ -89,8 +90,8 @@ export function App() {
 
   useEffect(() => {
     const code = view.k === "waiting" ? view.code : codeFromPath();
-    document.title = code ? `${code} · cloudnt` : LANDING_TITLE;
-  }, [view]);
+    document.title = code ? `${code} · cloudnt` : t.app.title;
+  }, [view, t]);
 
   // Waiting room channel: only reaches the visitor themselves.
   useEffect(() => {
@@ -104,7 +105,7 @@ export function App() {
       onEvent: (event) => {
         if (event.type === "approved") openRoom(String(event.code ?? code), String(event.token), "member");
         else if (event.type === "rejected") setView({ ...view, rejected: true });
-        else if (event.type === "closed") goHome("Esa sala ya no existe.");
+        else if (event.type === "closed") goHome(strings().app.noRoom);
       },
     });
   }, [view.k, view.k === "waiting" ? view.pendingId : null]);
@@ -114,7 +115,7 @@ export function App() {
       return (
         <div class="center-note">
           <Logo />
-          <p style="color: var(--ink-muted)">Un momento...</p>
+          <p style="color: var(--ink-muted)">{t.app.opening}</p>
         </div>
       );
 
@@ -133,6 +134,7 @@ export function App() {
         <Room
           token={view.token}
           onCode={(code) => history.replaceState(null, "", `/${code}`)}
+          onHome={() => goHome()}
           onExit={(reason) => {
             forget(view.token);
             goHome(reason);
@@ -152,7 +154,7 @@ export function App() {
             } catch (error) {
               setView({
                 k: "home",
-                error: error instanceof ApiError ? error.message : "No se pudo crear la sala.",
+                error: error instanceof ApiError ? error.message : strings().app.noCreate,
               });
             }
           }}

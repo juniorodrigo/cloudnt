@@ -62,13 +62,22 @@ Todo por variables de entorno, todo con un valor por defecto sensato.
 | `NODE_ENV` | — | `production` activa el servido del cliente |
 | `CLOUDNT_DATA` | `./data` | directorio de la base SQLite |
 | `CLOUDNT_FILES` | `$CLOUDNT_DATA/files` | directorio de archivos subidos |
-| `CLOUDNT_TRUST_PROXY` | — | `1` para hacer caso a `x-forwarded-for` |
+| `CLOUDNT_TRUST_PROXY` | — | `1` para hacer caso a la cabecera de IP del proxy |
+| `CLOUDNT_CLIENT_IP_HEADER` | `x-forwarded-for` | qué cabecera trae la IP del cliente |
+| `CLOUDNT_DISK_BYTES` | `20 GB` | tope global de disco |
 
 `CLOUDNT_TRUST_PROXY` merece cuidado. Sin proxy delante la cabecera la controla quien
 llama, y entonces toda cuota por IP deja de existir: basta un valor nuevo por petición
-para probar códigos sin límite. Actívala solo cuando haya un proxy que la escriba, y
-asegúrate de que sea **exactamente un salto** — el servidor lee el último elemento de
-la cadena, que es el único que un proxy que añade no puede falsificar.
+para probar códigos sin límite. Actívala solo cuando haya un proxy que la escriba.
+
+Detrás de Cloudflare, pon además `CLOUDNT_CLIENT_IP_HEADER=cf-connecting-ip`. El
+motivo está más abajo, y no es opcional.
+
+`CLOUDNT_DISK_BYTES` es el único tope que mira el disco entero. Los límites de abajo
+son por sala y se multiplican en lugar de acumularse, así que sin él el techo teórico
+son 2,5 TB. Ajústalo al disco de la máquina dejando margen: la cuenta reserva el
+tamaño **declarado** de cada archivo desde que se anuncia, no el que ha llegado, para
+que varias subidas simultáneas no atraviesen el mismo hueco libre.
 
 Los límites de abuso viven en [`server/config.ts`](server/config.ts) y no son
 configurables por entorno: son decisiones de diseño, no de despliegue.
@@ -80,11 +89,24 @@ configurables por entorno: son decisiones de diseño, no de despliegue.
 | salas concurrentes | 500 |
 | miembros por sala | 16 |
 | texto por sala | 8 MB |
-| archivo suelto | 2 GB |
+| archivo suelto | 1 GB |
+| almacenamiento por sala | 1 GB |
 | tráfico por sala | 5 GB |
 | archivos por sala | 20 |
 
-## Despliegue en una VM
+El almacenamiento es un presupuesto único: el texto del editor, las pegadas y los
+archivos comparten el mismo gigabyte. El pie de la sala lo muestra como
+porcentaje, y al llegar al 100 % la sala pasa a sólo lectura — se puede seguir
+leyendo y descargando, pero nada nuevo entra hasta que se borre algo. Encogerse
+siempre se permite, o el límite bloquearía la salida del límite.
+
+El tráfico va aparte, porque cuenta bytes movidos y no ocupados: un archivo
+descargado diez veces sigue ocupando su tamaño una sola vez.
+
+## Despliegue
+
+Sirve igual para una VM con IP pública que para una máquina en casa detrás de un
+router: el túnel de la sección correspondiente resuelve el segundo caso.
 
 ### Dimensionar
 
@@ -93,16 +115,16 @@ en que aparecen los cuellos de botella es: descriptores de fichero (uno por cone
 y `ulimit -n` son 1 024 por defecto), luego RAM, luego escrituras a SQLite, y en la
 práctica el ancho de banda antes que ninguno.
 
-El disco es el número que sorprende. Cada sala puede mover 5 GB, y hay 500 salas: el
-peor caso son **2,5 TB**. No hay tope global de disco, solo por sala. Con el TTL de
-24 h el suelo se recicla a diario, así que para uso normal el riesgo real no es el uso
-legítimo sino que alguien decida llenarte el disco a propósito.
+El disco no se dimensiona por los límites por sala, porque esos se multiplican: 500
+salas de 5 GB son 2,5 TB. Lo que manda es `CLOUDNT_DISK_BYTES`, que es un tope duro
+sobre todo lo almacenado a la vez. Ponlo por debajo del disco real y olvídate.
 
 | | Uso personal o de equipo | Público, con margen |
 |---|---|---|
 | vCPU | 1 | 2 |
 | RAM | 1 GB | 2 GB |
-| Disco | 40 GB | 80 GB + alerta al 80 % |
+| Disco | 40 GB | 80 GB |
+| `CLOUDNT_DISK_BYTES` | 20 GB | 50 GB |
 
 El trabajo es todo E/S, así que la CPU casi nunca es el límite.
 
@@ -146,7 +168,9 @@ Group=cloudnt
 WorkingDirectory=/opt/cloudnt/app
 Environment=NODE_ENV=production
 Environment=CLOUDNT_DATA=/var/lib/cloudnt
+Environment=CLOUDNT_DISK_BYTES=21474836480
 Environment=CLOUDNT_TRUST_PROXY=1
+Environment=CLOUDNT_CLIENT_IP_HEADER=cf-connecting-ip
 ExecStart=/opt/cloudnt/.bun/bin/bun run server/index.ts
 Restart=always
 RestartSec=2
@@ -171,51 +195,78 @@ hace compatible `ProtectSystem=strict` con que la aplicación escriba.
 systemctl daemon-reload && systemctl enable --now cloudnt
 ```
 
-### TLS y proxy inverso
+### Exponerlo con Cloudflare Tunnel
 
-Caddy, porque resuelve el certificado solo y pasa WebSocket sin configuración.
-
-```sh
-apt install -y caddy
-```
-
-`/etc/caddy/Caddyfile`:
-
-```
-cloudnt.org {
-	reverse_proxy 127.0.0.1:3000
-}
-```
-
-Eso es todo: Caddy no bufferea las respuestas, así que el canal SSE de respaldo llega
-sin retención, y el WebSocket se actualiza sin declarar nada.
-
-Apunta un registro `A` de `cloudnt.org` a la IP de la VM antes de recargar, o el
-certificado no se emitirá.
+Pensado para una máquina sin IP pública, detrás del router de casa. `cloudflared` abre
+una conexión **saliente** hacia Cloudflare y el tráfico entra por ahí: no hay puertos
+que abrir, ni redirección en el router, ni certificado que renovar, y la IP doméstica
+no aparece en ningún DNS.
 
 ```sh
-systemctl reload caddy
-ufw allow 22,80,443/tcp && ufw enable
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+  -o /usr/share/keyrings/cloudflare-main.gpg
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+  > /etc/apt/sources.list.d/cloudflared.list
+apt update && apt install -y cloudflared
 ```
 
-### Si además pones Cloudflare delante
-
-Con el proxy naranja activado son **dos saltos**, y ahí `CLOUDNT_TRUST_PROXY=1` se
-vuelve en tu contra: Cloudflare escribe la IP del cliente, Caddy añade la de
-Cloudflare detrás, y el servidor lee la última. Todas las cuotas por IP colapsarían
-sobre un puñado de direcciones de Cloudflare.
-
-La solución es que Caddy reescriba la cabecera con la IP real en lugar de añadirse:
-
-```
-cloudnt.org {
-	reverse_proxy 127.0.0.1:3000 {
-		header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
-	}
-}
+```sh
+cloudflared tunnel login          # autoriza cloudnt.org en el navegador
+cloudflared tunnel create cloudnt # imprime el UUID y deja el JSON de credenciales
 ```
 
-Con DNS gris (sin proxy de Cloudflare) el `Caddyfile` simple ya es correcto.
+`/etc/cloudflared/config.yml`:
+
+```yaml
+tunnel: <UUID>
+credentials-file: /etc/cloudflared/<UUID>.json
+ingress:
+  - hostname: cloudnt.org
+    service: http://127.0.0.1:3000
+  - service: http_status:404
+```
+
+```sh
+cloudflared tunnel route dns cloudnt cloudnt.org   # crea el CNAME
+cloudflared service install
+systemctl enable --now cloudflared
+```
+
+El firewall entrante puede quedarse cerrado del todo:
+
+```sh
+ufw default deny incoming && ufw allow 22/tcp && ufw enable
+```
+
+### Lo que el túnel cambia para esta aplicación
+
+**La IP del cliente es lo único que hay que configurar a mano.** Cloudflare escribe
+`CF-Connecting-IP` en cada petición y siempre la sobrescribe, mientras que a
+`X-Forwarded-For` se limita a añadirse: si quien llama manda su propio
+`X-Forwarded-For`, ese valor sobrevive dentro de la cadena. Como el servidor lee el
+último elemento, con `x-forwarded-for` dependerías de que ningún salto intermedio
+añada nada después — algo que ni Cloudflare ni `cloudflared` garantizan por escrito.
+Con `cf-connecting-ip` el valor entero lo pone el edge y la cuestión desaparece. De
+ahí que la unit lleve `CLOUDNT_CLIENT_IP_HEADER=cf-connecting-ip`: sin eso, las cuotas
+por IP se apoyan en una suposición.
+
+**Lo demás ya está resuelto en el código.** El túnel pasa WebSocket sin configurar
+nada. Cloudflare corta las conexiones HTTP inactivas a los 100 s, y el latido va cada
+25 s. El canal SSE de respaldo ya viaja con `cache-control: no-transform` y
+`x-accel-buffering: no`, que es justo lo que impide que el edge lo retenga. El plan
+gratuito rechaza peticiones de más de 100 MB, y ningún trozo pasa de 5 MB.
+
+**Las descargas son el problema, y son dos.** El primero es tu línea: cada byte que
+alguien se descarga sale por la subida de tu conexión doméstica, que en fibra suele
+ser una fracción de la bajada. Un archivo de 1 GB satura eso durante minutos. El
+segundo es el contrato: la sección 2.8 de los términos de Cloudflare reserva el plan
+gratuito para contenido principalmente HTML y desaconseja usarlo para servir archivos
+grandes. Una aplicación de transferencia con un tope de 1 GB por archivo es
+precisamente el caso al que apunta esa cláusula.
+
+Las dos se arreglan igual: sacar los archivos a almacenamiento S3 y servirlos con URL
+firmada, de modo que los bytes nunca pasen por tu casa ni por el CDN. Mientras eso no
+esté, baja `fileBytes` en `server/config.ts` a algo que tu subida tolere.
 
 ## Operación
 
@@ -240,9 +291,12 @@ descarga (30 s de vida) y las ventanas de rate limit.
 ```sh
 journalctl -u cloudnt -f
 du -sh /var/lib/cloudnt/files
+journalctl -u cloudflared -f
 ```
 
-Vigila ese `du`. Es la única métrica del sistema sin tope automático.
+Si ese `du` se acerca a `CLOUDNT_DISK_BYTES`, las subidas empiezan a responder `507` y
+la interfaz dice que no queda espacio. Es contención, no un fallo: en cuanto caducan
+salas el hueco vuelve. Si pasa a menudo, sube el tope o el disco.
 
 ## Estructura
 

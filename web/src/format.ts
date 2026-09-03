@@ -1,5 +1,7 @@
+import { strings } from "./i18n.ts";
+
 export function formatRemaining(ms: number): string {
-  if (ms <= 0) return "expirada";
+  if (ms <= 0) return strings().expired;
   const minutes = Math.floor(ms / 60000);
   if (minutes < 1) return `${Math.max(1, Math.floor(ms / 1000))} s`;
   if (minutes < 60) return `${minutes} min`;
@@ -10,10 +12,10 @@ export function formatRemaining(ms: number): string {
 
 export function formatAge(timestamp: number): string {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
-  if (seconds < 60) return "ahora";
+  const t = strings();
+  if (seconds < 60) return t.justNow;
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `hace ${minutes} min`;
-  return `hace ${Math.floor(minutes / 60)} h`;
+  return t.ago(minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h`);
 }
 
 export function formatSize(bytes: number): string {
@@ -24,6 +26,15 @@ export function formatSize(bytes: number): string {
 }
 
 export const formatBytes = (text: string) => formatSize(new Blob([text]).size);
+
+/** Neither end rounds into the other: a room with anything in it never reads
+ *  0 %, and one with anything left never reads 100 %. */
+export function formatPercent(value: number): string {
+  if (value <= 0) return "0 %";
+  if (value < 1) return "<1 %";
+  if (value >= 100) return "100 %";
+  return `${Math.min(99, Math.round(value))} %`;
+}
 
 /**
  * navigator.clipboard requires a secure context, and the spec accepts that

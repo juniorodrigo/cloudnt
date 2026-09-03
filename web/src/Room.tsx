@@ -7,14 +7,24 @@ import {
   type Member,
   type PendingRequest,
   type Snapshot,
+  type Usage,
 } from "./api.ts";
 import { connect, type ConnectionStatus, type ServerEvent } from "./transport.ts";
-import { renameCode, saveStackWidth, savedStackWidth } from "./store.ts";
+import { clearsOnPin, renameCode, saveClearsOnPin, saveStackWidth, savedStackWidth } from "./store.ts";
 import { sendFile } from "./uploads.ts";
 import { Logo } from "./Logo.tsx";
 import { Icon } from "./icons.tsx";
 import { Menu, Modal } from "./ui.tsx";
-import { copyText, downloadText, formatAge, formatBytes, formatRemaining, formatSize } from "./format.ts";
+import { currentLang, setLang, strings, useT } from "./i18n.ts";
+import {
+  copyText,
+  downloadText,
+  formatAge,
+  formatBytes,
+  formatPercent,
+  formatRemaining,
+  formatSize,
+} from "./format.ts";
 
 type State = {
   ready: boolean;
@@ -29,6 +39,7 @@ type State = {
   pending: PendingRequest[];
   history: HistoryItem[];
   files: FileItem[];
+  usage: Usage;
   expiresAt: number;
   autoApproveUntil: number;
   status: ConnectionStatus;
@@ -58,6 +69,7 @@ const initial: State = {
   pending: [],
   history: [],
   files: [],
+  usage: { used: 0, limit: 0 },
   expiresAt: 0,
   autoApproveUntil: 0,
   status: "connecting",
@@ -80,6 +92,7 @@ function reducer(state: State, action: Action): State {
         pending: snap.pending,
         history: snap.history,
         files: snap.files,
+        usage: snap.usage,
         expiresAt: snap.expiresAt,
         autoApproveUntil: snap.autoApproveUntil,
       };
@@ -135,6 +148,8 @@ function reducer(state: State, action: Action): State {
           return { ...state, history: e.items as HistoryItem[] };
         case "files":
           return { ...state, files: e.items as FileItem[] };
+        case "usage":
+          return { ...state, usage: { used: Number(e.used), limit: Number(e.limit) } };
         case "expiry":
           return { ...state, expiresAt: Number(e.expiresAt), renewedAt: Date.now() };
         case "code":
@@ -166,11 +181,13 @@ type Confirmation = {
 type Props = {
   token: string;
   onExit: (reason?: string) => void;
+  /** Leaving on purpose, unlike onExit: the token is kept so coming back skips the approval. */
+  onHome: () => void;
   /** The code can rotate live; the URL must follow it or there would be no token on reload. */
   onCode: (code: string) => void;
 };
 
-export function Room({ token, onExit, onCode }: Props) {
+export function Room({ token, onExit, onHome, onCode }: Props) {
   const [state, dispatch] = useReducer(reducer, initial);
   const [now, setNow] = useState(Date.now());
   const [toast, setToast] = useState<{ text: string; undo?: () => void } | null>(null);
@@ -179,15 +196,20 @@ export function Room({ token, onExit, onCode }: Props) {
   const [failed, setFailed] = useState<Record<string, string>>({});
   const [dragging, setDragging] = useState(false);
   const [stackWidth, setStackWidth] = useState(() => clampStack(savedStackWidth() ?? STACK_DEFAULT));
+  const [clearAfterPin, setClearAfterPin] = useState(clearsOnPin);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const pickerRef = useRef<HTMLInputElement>(null);
   const resizeFrom = useRef<{ x: number; width: number } | null>(null);
   /** The picked File never leaves the tab: it is what a resume reads from. */
   const localFiles = useRef(new Map<string, File>());
   const queue = useRef<Promise<unknown>>(Promise.resolve());
+  const t = useT();
 
   const isOwner = state.role === "owner";
   const dirty = isDirty(state);
+  const { used, limit } = state.usage;
+  const usedPercent = limit > 0 ? (used / limit) * 100 : 0;
+  const full = state.ready && limit > 0 && used >= limit;
   const remaining = state.expiresAt - now;
   const expiringSoon = state.ready && remaining < 10 * 60 * 1000;
   const justRenewed = now - state.renewedAt < 1500;
@@ -213,7 +235,7 @@ export function Room({ token, onExit, onCode }: Props) {
         onCode(snap.code);
       } catch (error) {
         if (error instanceof ApiError && (error.status === 401 || error.status === 404)) {
-          onExit("Esa sala ya no existe.");
+          onExit(strings().app.noRoom);
         }
       }
     };
@@ -225,9 +247,10 @@ export function Room({ token, onExit, onCode }: Props) {
       onResync: load,
       onStatus: (status) => dispatch({ type: "status", status }),
       onEvent: (event) => {
-        if (event.type === "kicked") return onExit("El dueño te sacó de la sala.");
+        if (event.type === "kicked") return onExit(strings().room.kicked);
         if (event.type === "closed") {
-          return onExit(event.reason === "expired" ? "La sala expiró." : "El dueño cerró la sala.");
+          const s = strings().room;
+          return onExit(event.reason === "expired" ? s.expired : s.closed);
         }
         if (event.type === "code") {
           renameCode(token, String(event.code));
@@ -246,6 +269,10 @@ export function Room({ token, onExit, onCode }: Props) {
   // Debounced write: batches keystrokes into one write every 300 ms.
   useEffect(() => {
     if (!state.ready || state.conflict || !dirty) return;
+    // A full room refuses anything longer than what it already holds, so writing
+    // it out would fail once per keystroke. Shorter still goes: that is the way
+    // back under the limit.
+    if (full && state.draft.length > state.serverText.length) return;
     const pending = state.draft;
     const timer = setTimeout(async () => {
       try {
@@ -264,27 +291,37 @@ export function Room({ token, onExit, onCode }: Props) {
       }
     }, 300);
     return () => clearTimeout(timer);
-  }, [state.draft, state.serverText, state.serverRev, state.conflict, state.ready]);
+  }, [state.draft, state.serverText, state.serverRev, state.conflict, state.ready, full]);
+
+  /**
+   * The handlers read state that changes without the listener noticing — the
+   * debounced write bumps serverRev on its own — so the listener goes through a
+   * ref every render refreshes. A dependency list would have to enumerate
+   * everything the three shortcuts touch, and a stale rev pins against the wrong
+   * revision and fails as a conflict.
+   */
+  const onKeyRef = useRef<(event: KeyboardEvent) => void>(() => {});
+  onKeyRef.current = (event: KeyboardEvent) => {
+    if (!event.altKey) return;
+    if (event.key === "c") {
+      event.preventDefault();
+      void handleCopy();
+    }
+    if (event.key === "s") {
+      event.preventDefault();
+      downloadText(state.draft, `cloudnt-${state.code}.txt`);
+    }
+    if (event.key === "n") {
+      event.preventDefault();
+      void pinCurrent();
+    }
+  };
 
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (!event.altKey) return;
-      if (event.key === "c") {
-        event.preventDefault();
-        void handleCopy();
-      }
-      if (event.key === "s") {
-        event.preventDefault();
-        downloadText(state.draft, `cloudnt-${state.code}.txt`);
-      }
-      if (event.key === "n") {
-        event.preventDefault();
-        void pinCurrent();
-      }
-    };
+    const onKey = (event: KeyboardEvent) => onKeyRef.current(event);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [state.draft, state.code]);
+  }, []);
 
   useEffect(() => {
     const onResize = () => setStackWidth((width) => clampStack(width));
@@ -293,28 +330,39 @@ export function Room({ token, onExit, onCode }: Props) {
   }, []);
 
   const handleCopy = async () => {
-    if (await copyText(state.draft)) return notify("Copiado al portapapeles");
+    if (await copyText(state.draft)) return notify(t.room.copied);
     editorRef.current?.select();
-    notify("Sin permiso de portapapeles: el texto quedó seleccionado, pulsa Ctrl+C");
+    notify(t.room.noClipboardSelected);
   };
 
   const pinCurrent = async () => {
     if (state.draft.trim() === "") return;
+    if (full) return notify(t.room.fullPin);
     await guard(async () => {
       // Pinning takes the server's copy, so the debounced write has to land
       // first or the entry misses the last keystrokes of a fresh paste.
+      let rev = state.serverRev;
       if (dirty) {
-        const { rev } = await api.putText(token, state.draft, state.serverRev);
+        ({ rev } = await api.putText(token, state.draft, rev));
         dispatch({ type: "commit", text: state.draft, rev });
       }
       await api.pinText(token);
+
+      if (clearAfterPin) {
+        // Committing the empty text as well as drafting it keeps the editor from
+        // looking unsaved and stops the debounce from writing the old text back.
+        const cleared = await api.putText(token, "", rev);
+        dispatch({ type: "draft", text: "" });
+        dispatch({ type: "commit", text: "", rev: cleared.rev });
+      }
+
       setTab("text");
-      notify("Fijado como pegada");
+      notify(clearAfterPin ? t.room.pinnedCleared : t.room.pinned);
     });
   };
 
   const copyEntry = async (text: string) => {
-    notify((await copyText(text)) ? "Pegada copiada" : "Sin permiso de portapapeles");
+    notify((await copyText(text)) ? t.room.entryCopied : t.room.noClipboard);
   };
 
   /** The old single-buffer behaviour, kept as one deliberate action. */
@@ -322,7 +370,7 @@ export function Room({ token, onExit, onCode }: Props) {
     const all = [state.draft, ...state.history.map((item) => item.content)]
       .filter((text) => text.trim() !== "")
       .join("\n\n");
-    notify((await copyText(all)) ? "Todo copiado al portapapeles" : "Sin permiso de portapapeles");
+    notify((await copyText(all)) ? t.room.allCopied : t.room.noClipboard);
   };
 
   const keepMine = async () => {
@@ -335,6 +383,14 @@ export function Room({ token, onExit, onCode }: Props) {
       if (error instanceof ApiError) notify(error.message);
     }
   };
+
+  const confirmClose = () =>
+    setConfirming({
+      title: t.room.closeTitle,
+      body: t.room.closeBody,
+      label: t.room.close,
+      run: () => void guard(() => api.closeRoom(token)),
+    });
 
   const guard = async (action: () => Promise<unknown>) => {
     try {
@@ -358,20 +414,21 @@ export function Room({ token, onExit, onCode }: Props) {
         await sendFile(token, id, file);
         localFiles.current.delete(id);
       } catch (error) {
-        const message = error instanceof ApiError ? error.message : "se cortó la subida";
+        const message = error instanceof ApiError ? error.message : strings().room.uploadCut;
         setFailed((current) => ({ ...current, [id]: message }));
       }
     });
   };
 
   const addFiles = async (picked: FileList | null) => {
+    if (full) return notify(t.room.fullUpload);
     for (const file of Array.from(picked ?? [])) {
       try {
         const created = await api.createFile(token, file.name, file.size);
         localFiles.current.set(created.id, file);
         runUpload(created.id);
       } catch (error) {
-        if (error instanceof ApiError) notify(`${file.name}: ${error.message}`);
+        if (error instanceof ApiError) notify(t.room.uploadFailed(file.name, error.message));
       }
     }
   };
@@ -380,7 +437,7 @@ export function Room({ token, onExit, onCode }: Props) {
     return (
       <div class="center-note">
         <Logo />
-        <p style="color: var(--ink-muted)">Abriendo la sala...</p>
+        <p style="color: var(--ink-muted)">{t.room.opening}</p>
       </div>
     );
   }
@@ -390,11 +447,21 @@ export function Room({ token, onExit, onCode }: Props) {
       <header class="room-bar">
         <button
           type="button"
+          class="room-back"
+          aria-label={t.room.home}
+          data-tip={t.room.homeTip}
+          onClick={onHome}
+        >
+          <Icon name="home" />
+        </button>
+
+        <button
+          type="button"
           class="room-code"
-          title="Copiar el enlace de la sala"
+          title={t.room.copyLink}
           onClick={async () => {
             const link = `${location.origin}/${state.code}`;
-            notify((await copyText(link)) ? "Enlace copiado" : link);
+            notify((await copyText(link)) ? t.room.linkCopied : link);
           }}
         >
           <Logo mark />
@@ -402,35 +469,40 @@ export function Room({ token, onExit, onCode }: Props) {
         </button>
 
         <div class="bar-actions">
-          <button type="button" class="btn btn-secondary btn-sm" title="Alt+C" onClick={() => void handleCopy()}>
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
+            data-tip={t.room.copyTip}
+            onClick={() => void handleCopy()}
+          >
             <Icon name="copy" />
-            <span class="btn-label">Copiar</span>
+            <span class="btn-label">{t.room.copy}</span>
           </button>
           <button
             type="button"
             class="btn btn-secondary btn-sm"
-            title="Alt+N · guarda este texto como una pegada aparte, para que el siguiente no lo pise"
-            disabled={state.draft.trim() === ""}
+            data-tip={t.room.pinTip}
+            disabled={state.draft.trim() === "" || full}
             onClick={() => void pinCurrent()}
           >
             <Icon name="pin" />
-            <span class="btn-label">Nueva pegada</span>
+            <span class="btn-label">{t.room.pin}</span>
           </button>
           <button
             type="button"
             class="btn btn-secondary btn-sm"
-            title="Alt+S"
+            data-tip={t.room.downloadTip}
             onClick={() => downloadText(state.draft, `cloudnt-${state.code}.txt`)}
           >
             <Icon name="download" />
-            <span class="btn-label">Descargar</span>
+            <span class="btn-label">{t.room.download}</span>
           </button>
         </div>
 
         <span class="room-bar-spacer" />
 
         <Menu
-          title="Dispositivos en la sala"
+          title={t.room.devices}
           label={
             <>
               <Icon name="devices" />
@@ -441,7 +513,7 @@ export function Room({ token, onExit, onCode }: Props) {
         >
           {isOwner && state.pending.length > 0 ? (
             <div class="menu-group">
-              <h3>Esperando aprobación</h3>
+              <h3>{t.room.waitingApproval}</h3>
               {state.pending.map((request) => (
                 <div key={request.id} class="pending">
                   <div class="pending-fingerprint">{request.fingerprint}</div>
@@ -454,7 +526,7 @@ export function Room({ token, onExit, onCode }: Props) {
                       class="btn btn-primary btn-sm"
                       onClick={() => void guard(() => api.approve(token, request.id))}
                     >
-                      Aprobar
+                      {t.room.approve}
                     </button>
                     <button
                       type="button"
@@ -462,13 +534,13 @@ export function Room({ token, onExit, onCode }: Props) {
                       onClick={() =>
                         void guard(async () => {
                           await api.reject(token, request.id);
-                          notify(`Rechazado ${request.fingerprint}`, () =>
+                          notify(t.room.rejected(request.fingerprint), () =>
                             void guard(() => api.approve(token, request.id)),
                           );
                         })
                       }
                     >
-                      Rechazar
+                      {t.room.reject}
                     </button>
                   </div>
                 </div>
@@ -477,18 +549,18 @@ export function Room({ token, onExit, onCode }: Props) {
           ) : null}
 
           <div class="menu-group">
-            <h3>Dispositivos ({state.members.length})</h3>
+            <h3>{t.room.deviceCount(state.members.length)}</h3>
             {state.members.map((member) => (
               <div key={member.id} class="member-row">
                 <span class={`member-dot${member.online ? " online" : ""}`} aria-hidden="true" />
                 <span class="member-name">{member.fingerprint}</span>
-                {member.id === state.memberId ? <span class="tag">tú</span> : null}
-                {member.role === "owner" ? <span class="tag">dueño</span> : null}
+                {member.id === state.memberId ? <span class="tag">{t.room.you}</span> : null}
+                {member.role === "owner" ? <span class="tag">{t.room.owner}</span> : null}
                 {isOwner && member.role !== "owner" ? (
                   <button
                     type="button"
                     class="icon-btn"
-                    title={`Expulsar a ${member.fingerprint}`}
+                    title={t.room.kick(member.fingerprint)}
                     onClick={() => void guard(() => api.kick(token, member.id))}
                   >
                     <Icon name="close" />
@@ -499,99 +571,133 @@ export function Room({ token, onExit, onCode }: Props) {
           </div>
         </Menu>
 
-        {isOwner ? (
-          <Menu title="Ajustes de la sala" label={<Icon name="settings" />}>
-            <div class="menu-group">
-              <h3>Acceso</h3>
-              <button
-                type="button"
-                class="menu-item"
-                onClick={() =>
-                  void guard(async () => {
-                    const active = state.autoApproveUntil > Date.now();
-                    await api.setAutoApprove(token, active ? 0 : 5);
-                    notify(active ? "Auto-aprobar desactivado" : "Auto-aprobar activo 5 min");
-                  })
-                }
-              >
-                {state.autoApproveUntil > Date.now()
-                  ? `Auto-aprobar: ${formatRemaining(state.autoApproveUntil - now)}`
-                  : "Auto-aprobar 5 min"}
-              </button>
-              <button
-                type="button"
-                class="menu-item"
-                onClick={() =>
-                  void guard(async () => {
-                    await api.rotate(token);
-                    notify("Código rotado");
-                  })
-                }
-              >
-                Cambiar el código
-              </button>
-            </div>
-            <div class="menu-group">
-              <h3>Zona de riesgo</h3>
-              <button
-                type="button"
-                class="menu-item danger"
-                onClick={() =>
-                  setConfirming({
-                    title: "¿Vaciar la sala?",
-                    body: "Se borran el texto y las pegadas de todos los que estén dentro. Los archivos se quedan. No se puede deshacer.",
-                    label: "Vaciar",
-                    run: () =>
-                      void guard(async () => {
-                        const { rev } = await api.clearRoom(token);
-                        // Own echo does not update the draft, to avoid overwriting ongoing
-                        // typing. Clearing is the exception: the editor must end up empty.
-                        dispatch({ type: "draft", text: "" });
-                        dispatch({ type: "commit", text: "", rev });
-                        notify("Sala vaciada");
-                      }),
-                  })
-                }
-              >
-                Vaciar el contenido
-              </button>
-              <button
-                type="button"
-                class="menu-item danger"
-                onClick={() =>
-                  setConfirming({
-                    title: "¿Cerrar la sala?",
-                    body: "La sala desaparece ahora mismo con el texto, las pegadas y los archivos, y todos los conectados salen. No se puede deshacer.",
-                    label: "Cerrar la sala",
-                    run: () => void guard(() => api.closeRoom(token)),
-                  })
-                }
-              >
-                Cerrar la sala
-              </button>
-            </div>
-          </Menu>
-        ) : null}
+        <Menu title={t.room.settings} label={<Icon name="settings" />}>
+          <div class="menu-group">
+            <h3>{t.room.thisDevice}</h3>
+            <button
+              type="button"
+              class="menu-item menu-item-toggle"
+              onClick={() => setLang(currentLang() === "es" ? "en" : "es")}
+            >
+              {t.room.language}
+              <span class="tag">{t.langName}</span>
+            </button>
+            <button
+              type="button"
+              class="menu-item menu-item-toggle"
+              role="menuitemcheckbox"
+              aria-checked={clearAfterPin}
+              onClick={() => {
+                const next = !clearAfterPin;
+                setClearAfterPin(next);
+                saveClearsOnPin(next);
+              }}
+            >
+              {t.room.clearOnPin}
+              <span class="tag">{clearAfterPin ? t.room.yes : t.room.no}</span>
+            </button>
+          </div>
+
+          {isOwner ? (
+            <>
+              <div class="menu-group">
+                <h3>{t.room.access}</h3>
+                <button
+                  type="button"
+                  class="menu-item"
+                  onClick={() =>
+                    void guard(async () => {
+                      const active = state.autoApproveUntil > Date.now();
+                      await api.setAutoApprove(token, active ? 0 : 5);
+                      notify(active ? t.room.autoApproveDisabled : t.room.autoApproveEnabled);
+                    })
+                  }
+                >
+                  {state.autoApproveUntil > Date.now()
+                    ? t.room.autoApproveOn(formatRemaining(state.autoApproveUntil - now))
+                    : t.room.autoApproveOff}
+                </button>
+                <button
+                  type="button"
+                  class="menu-item"
+                  onClick={() =>
+                    void guard(async () => {
+                      await api.rotate(token);
+                      notify(t.room.rotated);
+                    })
+                  }
+                >
+                  {t.room.rotate}
+                </button>
+              </div>
+
+              <div class="menu-group">
+                <h3>{t.room.danger}</h3>
+                <button
+                  type="button"
+                  class="menu-item danger"
+                  onClick={() =>
+                    setConfirming({
+                      title: t.room.wipeTitle,
+                      body: t.room.wipeBody,
+                      label: t.room.wipeLabel,
+                      run: () =>
+                        void guard(async () => {
+                          const { rev } = await api.clearRoom(token);
+                          // Own echo does not update the draft, to avoid overwriting ongoing
+                          // typing. Clearing is the exception: the editor must end up empty.
+                          dispatch({ type: "draft", text: "" });
+                          dispatch({ type: "commit", text: "", rev });
+                          notify(t.room.wiped);
+                        }),
+                    })
+                  }
+                >
+                  {t.room.wipe}
+                </button>
+                <button
+                  type="button"
+                  class="menu-item danger"
+                  onClick={confirmClose}
+                >
+                  {t.room.close}
+                </button>
+              </div>
+            </>
+          ) : null}
+        </Menu>
       </header>
 
       {state.conflict ? (
         <div class="banner banner-conflict" role="alert">
-          <strong>Alguien más editó el texto.</strong>
-          <span>Tu versión no se ha perdido: elige cuál se queda.</span>
+          <strong>{t.room.conflictTitle}</strong>
+          <span>{t.room.conflictBody}</span>
           <button type="button" class="btn btn-secondary btn-sm" onClick={() => dispatch({ type: "takeTheirs" })}>
-            Traer la nueva
+            {t.room.takeTheirs}
           </button>
           <button type="button" class="btn btn-primary btn-sm" onClick={() => void keepMine()}>
-            Conservar la mía
+            {t.room.keepMine}
           </button>
+        </div>
+      ) : null}
+
+      {full ? (
+        <div class="banner banner-error" role="alert">
+          <strong>{t.room.fullTitle}</strong>
+          <span>{t.room.fullBody(formatSize(limit))}</span>
+          {isOwner ? (
+            <button type="button" class="btn btn-danger btn-sm" onClick={confirmClose}>
+              {t.room.close}
+            </button>
+          ) : null}
         </div>
       ) : null}
 
       {expiringSoon ? (
         <div class="banner banner-warn" role="status">
-          <strong>Esta sala se borra en {formatRemaining(remaining)}.</strong>
+          <strong>{t.room.expiresIn(formatRemaining(remaining))}</strong>
           <button type="button" class="btn btn-secondary btn-sm" onClick={() => void guard(() => api.keepAlive(token))}>
-            Mantener viva
+            {t.room.keepAlive}
           </button>
         </div>
       ) : null}
@@ -624,8 +730,8 @@ export function Room({ token, onExit, onCode }: Props) {
             value={state.draft}
             spellcheck={false}
             autocomplete="off"
-            aria-label="Contenido compartido de la sala"
-            placeholder="Pega aquí lo que quieras mover a la otra máquina."
+            aria-label={t.room.editorLabel}
+            placeholder={t.room.editorPlaceholder}
             onInput={(event) => dispatch({ type: "draft", text: event.currentTarget.value })}
           />
         </div>
@@ -634,7 +740,7 @@ export function Room({ token, onExit, onCode }: Props) {
           class="resizer"
           role="separator"
           aria-orientation="vertical"
-          aria-label="Ancho del panel lateral"
+          aria-label={t.room.resizer}
           aria-valuenow={stackWidth}
           aria-valuemin={STACK_MIN}
           aria-valuemax={Math.round(window.innerWidth - EDITOR_MIN)}
@@ -671,7 +777,8 @@ export function Room({ token, onExit, onCode }: Props) {
               class={`tab${tab === "text" ? " active" : ""}`}
               onClick={() => setTab("text")}
             >
-              Pegadas<span class="tab-n">{state.history.length}</span>
+              {t.room.tabPastes}
+              <span class="tab-n">{state.history.length}</span>
             </button>
             <button
               type="button"
@@ -680,7 +787,8 @@ export function Room({ token, onExit, onCode }: Props) {
               class={`tab${tab === "files" ? " active" : ""}`}
               onClick={() => setTab("files")}
             >
-              Archivos<span class="tab-n">{state.files.length}</span>
+              {t.room.tabFiles}
+              <span class="tab-n">{state.files.length}</span>
             </button>
           </div>
 
@@ -688,13 +796,19 @@ export function Room({ token, onExit, onCode }: Props) {
             {tab === "text" ? (
               <button type="button" class="btn btn-secondary btn-sm" onClick={() => void copyAll()}>
                 <Icon name="copy" />
-                Copiar todo
+                {t.room.copyAll}
               </button>
             ) : (
               <>
-                <button type="button" class="btn btn-secondary btn-sm" onClick={() => pickerRef.current?.click()}>
+                <button
+                  type="button"
+                  class="btn btn-secondary btn-sm"
+                  disabled={full}
+                  title={full ? t.room.fullShort : undefined}
+                  onClick={() => pickerRef.current?.click()}
+                >
                   <Icon name="plus" />
-                  Subir archivo
+                  {t.room.upload}
                 </button>
                 <input
                   ref={pickerRef}
@@ -713,10 +827,7 @@ export function Room({ token, onExit, onCode }: Props) {
           <div class="stack-body">
             {tab === "text" ? (
               state.history.length === 0 ? (
-                <p class="empty">
-                  Cada vez que alguien pega algo distinto, lo anterior queda aquí como una pegada aparte. También
-                  puedes fijar el texto actual sin esperar a que lo reemplacen.
-                </p>
+                <p class="empty">{t.room.emptyPastes}</p>
               ) : (
                 state.history.map((item) => (
                   <article key={item.id} class="entry">
@@ -729,7 +840,7 @@ export function Room({ token, onExit, onCode }: Props) {
                       <button
                         type="button"
                         class="icon-btn"
-                        title="Copiar esta pegada"
+                        title={t.room.copyEntry}
                         onClick={() => void copyEntry(item.content)}
                       >
                         <Icon name="copy" />
@@ -737,7 +848,7 @@ export function Room({ token, onExit, onCode }: Props) {
                       <button
                         type="button"
                         class="icon-btn"
-                        title="Traerla al editor"
+                        title={t.room.restoreEntry}
                         onClick={() => dispatch({ type: "draft", text: item.content })}
                       >
                         <Icon name="history" />
@@ -745,7 +856,7 @@ export function Room({ token, onExit, onCode }: Props) {
                       <button
                         type="button"
                         class="icon-btn"
-                        title="Quitar esta pegada"
+                        title={t.room.removeEntry}
                         onClick={() => void guard(() => api.removeEntry(token, item.id))}
                       >
                         <Icon name="trash" />
@@ -755,7 +866,7 @@ export function Room({ token, onExit, onCode }: Props) {
                 ))
               )
             ) : state.files.length === 0 ? (
-              <p class="empty">Arrastra un archivo a la sala o pulsa Subir. Se borran con ella.</p>
+              <p class="empty">{t.room.emptyFiles}</p>
             ) : (
               state.files.map((item) => {
                 const percent = Math.round((item.received / item.chunks) * 100);
@@ -784,7 +895,7 @@ export function Room({ token, onExit, onCode }: Props) {
                         <button
                           type="button"
                           class="icon-btn"
-                          title="Descargar"
+                          title={t.room.download}
                           onClick={() =>
                             void guard(async () => {
                               const { ticket } = await api.downloadTicket(token, item.id);
@@ -796,14 +907,14 @@ export function Room({ token, onExit, onCode }: Props) {
                         </button>
                       ) : error && localFiles.current.has(item.id) ? (
                         <button type="button" class="btn btn-primary btn-sm" onClick={() => runUpload(item.id)}>
-                          Reanudar
+                          {t.room.resume}
                         </button>
                       ) : null}
                       {isOwner || item.authorId === state.memberId ? (
                         <button
                           type="button"
                           class="icon-btn"
-                          title="Quitar"
+                          title={t.room.remove}
                           onClick={() =>
                             void guard(async () => {
                               localFiles.current.delete(item.id);
@@ -825,27 +936,41 @@ export function Room({ token, onExit, onCode }: Props) {
         {dragging ? (
           <div class="drop-veil" aria-hidden="true">
             <Icon name="download" />
-            <span>Suelta para subirlo a la sala</span>
+            <span>{t.room.dropHere}</span>
           </div>
         ) : null}
       </div>
 
       <footer class="room-foot">
         <span class={`status-dot${state.status === "online" ? "" : " offline"}`}>
-          {state.status === "online" ? "conectado" : "reconectando"}
+          {state.status === "online" ? t.room.online : t.room.offline}
         </span>
-        <span class={`clock${expiringSoon ? " urgent" : ""}`}>
-          se borra en {formatRemaining(remaining)} sin actividad
-          {justRenewed ? <span class="clock-renewed"> · reiniciado</span> : null}
+        <span
+          class={`usage${full ? " usage-full" : ""}`}
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(usedPercent)}
+          aria-label={t.room.usageLabel}
+          title={t.room.usageTitle(formatSize(used), formatSize(limit))}
+        >
+          <span class="usage-bar" aria-hidden="true">
+            <span class="usage-fill" style={`width:${Math.min(100, usedPercent)}%`} />
+          </span>
+          {t.room.usageOf(formatPercent(usedPercent), formatSize(limit))}
+        </span>
+
+        <span>
+          {formatBytes(state.draft)} ·{" "}
+          <span class={dirty ? "foot-dirty" : undefined}>{dirty ? t.room.unsaved : t.room.synced}</span>
         </span>
 
         <span class="room-bar-spacer" />
 
-        <span>
-          {formatBytes(state.draft)} ·{" "}
-          <span class={dirty ? "foot-dirty" : undefined}>{dirty ? "sin guardar" : "sincronizado"}</span>
+        <span class={`clock${expiringSoon ? " urgent" : ""}`}>
+          {t.room.clock(formatRemaining(remaining))}
+          {justRenewed ? <span class="clock-renewed">{t.room.renewed}</span> : null}
         </span>
-        <span class="tools-hint">Alt+C copiar · Alt+N nueva pegada · Alt+S descargar</span>
       </footer>
 
       {confirming ? (
@@ -853,7 +978,7 @@ export function Room({ token, onExit, onCode }: Props) {
           <p>{confirming.body}</p>
           <div class="modal-actions">
             <button type="button" class="btn btn-secondary" onClick={() => setConfirming(null)}>
-              Cancelar
+              {t.room.cancel}
             </button>
             <button
               type="button"
@@ -880,7 +1005,7 @@ export function Room({ token, onExit, onCode }: Props) {
                 setToast(null);
               }}
             >
-              Deshacer
+              {t.room.undo}
             </button>
           ) : null}
         </div>

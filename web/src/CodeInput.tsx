@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { CODE_ALPHABET, CODE_LENGTH } from "./api.ts";
+import { useT } from "./i18n.ts";
 
 const clean = (raw: string) =>
   raw
@@ -25,6 +26,7 @@ export function CodeInput({ initial = "", invalid, disabled, onComplete }: Props
     Array.from({ length: CODE_LENGTH }, (_, i) => clean(initial)[i] ?? ""),
   );
   const refs = useRef<(HTMLInputElement | null)[]>([]);
+  const t = useT();
 
   useEffect(() => {
     refs.current[slots.findIndex((s) => s === "") === -1 ? CODE_LENGTH - 1 : slots.findIndex((s) => s === "")]?.focus();
@@ -66,7 +68,7 @@ export function CodeInput({ initial = "", invalid, disabled, onComplete }: Props
           spellcheck={false}
           autocomplete="off"
           maxLength={CODE_LENGTH}
-          aria-label={`Carácter ${index + 1} de ${CODE_LENGTH}`}
+          aria-label={t.app.charOf(index + 1, CODE_LENGTH)}
           onInput={(event) => {
             const field = event.currentTarget;
             const typed = clean(field.value);

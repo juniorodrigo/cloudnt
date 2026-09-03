@@ -497,7 +497,8 @@ Desde el día uno, no después:
 |---|---|
 | Salas por IP | 10 / hora |
 | Salas fijadas por IP | 3 |
-| Tamaño por archivo | 2 GB |
+| Tamaño por archivo | 1 GB |
+| Almacenamiento por sala | 1 GB (texto, pegadas y archivos juntos) |
 | Ancho de banda por sala | 5 GB |
 | Texto por sala | 8 MB |
 | Salas concurrentes | 500 |

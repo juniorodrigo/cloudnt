@@ -15,6 +15,16 @@ export const HOST = Bun.env.CLOUDNT_HOST ?? "127.0.0.1";
  */
 export const TRUST_PROXY = Bun.env.CLOUDNT_TRUST_PROXY === "1";
 
+/**
+ * Which header carries the caller's address. Cloudflare writes cf-connecting-ip
+ * itself on every request and never appends, so behind it that header is the
+ * only one whose whole value is known to come from the edge rather than partly
+ * from the caller. Read the last entry either way: one value stays one value.
+ */
+export const CLIENT_IP_HEADER = (
+  Bun.env.CLOUDNT_CLIENT_IP_HEADER ?? "x-forwarded-for"
+).toLowerCase();
+
 export const CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 export const CODE_LENGTH = 5;
 
@@ -42,6 +52,14 @@ export const CHUNK_SIZE = 5 * 1024 * 1024;
 /** A ticket is redeemed immediately by the browser; it only has to survive the click. */
 export const DOWNLOAD_TICKET_TTL_MS = 30 * 1000;
 
+/**
+ * Ceiling for everything held on disk at once. The per-room limits multiply
+ * instead of capping: 500 rooms allowed to move 5 GB each is 2.5 TB, which is
+ * not a number any machine this runs on has. Unlike the limits below this one
+ * is a property of the host, so it comes from the environment.
+ */
+export const DISK_BYTES = Number(Bun.env.CLOUDNT_DISK_BYTES ?? 20 * 1024 * 1024 * 1024);
+
 export const LIMITS = {
   roomsPerIpPerHour: 10,
   joinAttemptsPerIpPer5Min: 20,
@@ -49,7 +67,12 @@ export const LIMITS = {
   textBytesPerRoom: 8 * 1024 * 1024,
   historyEntries: 10,
   membersPerRoom: 16,
-  fileBytes: 2 * 1024 * 1024 * 1024,
+  fileBytes: 1024 * 1024 * 1024,
+  /**
+   * Everything a room holds at once — text, pinned entries and files — against
+   * a single budget. A lone file may fill it, so the per-file cap matches.
+   */
+  storageBytesPerRoom: 1024 * 1024 * 1024,
   bytesPerRoom: 5 * 1024 * 1024 * 1024,
   filesPerRoom: 20,
 };

@@ -1,3 +1,5 @@
+import { currentLang, strings } from "./i18n.ts";
+
 export const CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 export const CODE_LENGTH = 5;
 
@@ -31,6 +33,9 @@ export type FileItem = {
   received: number;
 };
 
+/** One budget for text, pinned entries and files together. */
+export type Usage = { used: number; limit: number };
+
 export type Snapshot = {
   code: string;
   role: "owner" | "member";
@@ -45,6 +50,7 @@ export type Snapshot = {
   members: Member[];
   history: HistoryItem[];
   files: FileItem[];
+  usage: Usage;
   pending: PendingRequest[];
 };
 
@@ -62,11 +68,14 @@ async function request<T>(path: string, init: RequestInit & { token?: string } =
   const headers = new Headers(init.headers);
   if (init.body) headers.set("content-type", "application/json");
   if (init.token) headers.set("authorization", `Bearer ${init.token}`);
+  // The app's own choice, not the browser's: they differ as soon as anyone uses
+  // the selector, and the errors end up in the same toasts as everything else.
+  headers.set("x-lang", currentLang());
 
   const res = await fetch(path, { ...init, headers });
   const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {
-    throw new ApiError(res.status, String(payload.error ?? "error de red"), payload);
+    throw new ApiError(res.status, String(payload.error ?? strings().app.netError), payload);
   }
   return payload as T;
 }
@@ -119,12 +128,12 @@ export const fileStatus = (token: string, id: string) =>
 export async function putChunk(token: string, id: string, n: number, chunk: Blob): Promise<void> {
   const res = await fetch(`/api/file/${id}/chunk/${n}`, {
     method: "PUT",
-    headers: { authorization: `Bearer ${token}` },
+    headers: { authorization: `Bearer ${token}`, "x-lang": currentLang() },
     body: chunk,
   });
   if (!res.ok) {
     const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    throw new ApiError(res.status, String(payload.error ?? "error de red"), payload);
+    throw new ApiError(res.status, String(payload.error ?? strings().app.netError), payload);
   }
 }
 

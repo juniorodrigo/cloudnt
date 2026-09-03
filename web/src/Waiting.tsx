@@ -1,4 +1,5 @@
 import { Logo } from "./Logo.tsx";
+import { useT } from "./i18n.ts";
 
 type Props = {
   code: string;
@@ -13,6 +14,8 @@ type Props = {
  * compared visually without typing anything.
  */
 export function Waiting({ code, fingerprint, rejected, onBack }: Props) {
+  const t = useT();
+
   return (
     <div class="waiting">
       <Logo />
@@ -20,28 +23,27 @@ export function Waiting({ code, fingerprint, rejected, onBack }: Props) {
       {rejected ? (
         <>
           <p class="fingerprint">{fingerprint}</p>
-          <h2 class="waiting-title">Acceso rechazado</h2>
+          <h2 class="waiting-title">{t.waiting.rejectedTitle}</h2>
           <p class="waiting-hint">
-            El dueño de la sala <strong>{code}</strong> no aprobó este dispositivo. Si fue un
-            error, puede deshacerlo durante 30 segundos y entrarías solo.
+            {t.waiting.rejectedPre}
+            <strong>{code}</strong>
+            {t.waiting.rejectedPost}
           </p>
         </>
       ) : (
         <>
           <p class="waiting-status">
             <span class="pulse" aria-hidden="true" />
-            Esperando aprobación para la sala <strong>{code}</strong>
+            {t.waiting.waitingPre}
+            <strong>{code}</strong>
           </p>
           <p class="fingerprint">{fingerprint}</p>
-          <p class="waiting-hint">
-            Comprueba que estas dos palabras son las mismas que aparecen en la pantalla donde
-            creaste la sala, y aprueba desde allí.
-          </p>
+          <p class="waiting-hint">{t.waiting.hint}</p>
         </>
       )}
 
       <button type="button" class="btn btn-secondary waiting-back" onClick={onBack}>
-        Volver
+        {t.waiting.back}
       </button>
     </div>
   );

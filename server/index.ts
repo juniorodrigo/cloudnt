@@ -1,6 +1,7 @@
 import type { ServerWebSocket } from "bun";
 import {
   CHUNK_SIZE,
+  CLIENT_IP_HEADER,
   CODE_ALPHABET,
   CODE_LENGTH,
   DEV,
@@ -15,6 +16,7 @@ import * as bus from "./bus.ts";
 import * as rooms from "./rooms.ts";
 import * as files from "./files.ts";
 import { sweepLimits, take } from "./limits.ts";
+import { type Lang, langOf, msg } from "./i18n.ts";
 import type { MemberRow, RoomRow } from "./db.ts";
 
 const CODE_RE = new RegExp(`^[${CODE_ALPHABET}]{${CODE_LENGTH}}$`);
@@ -35,7 +37,7 @@ function clientIp(req: Request, server: { requestIP(r: Request): { address: stri
     // The *last* entry, not the first: proxies append, so a client that sends
     // its own x-forwarded-for gets it kept and the real address added after it.
     // Reading the head would hand every per-IP quota a value the caller picks.
-    const forwarded = req.headers.get("x-forwarded-for");
+    const forwarded = req.headers.get(CLIENT_IP_HEADER);
     if (forwarded) return forwarded.split(",").pop()!.trim();
   }
   return server.requestIP(req)?.address ?? "unknown";
@@ -159,15 +161,16 @@ function issueTicket(roomId: string, fileId: string): string {
   return id;
 }
 
-function download(ticketId: string): Response {
+function download(ticketId: string, lang: Lang): Response {
+  const M = msg(lang);
   const ticket = tickets.get(ticketId);
   tickets.delete(ticketId);
-  if (!ticket || Date.now() > ticket.expires) return fail(404, "ese enlace ya se usó o expiró");
+  if (!ticket || Date.now() > ticket.expires) return fail(404, M.ticketSpent);
 
   const room = rooms.roomById(ticket.roomId);
-  if (!room) return fail(404, "esa sala ya no existe");
+  if (!room) return fail(404, M.roomGone);
   const file = files.fileById(room.id, ticket.fileId);
-  if (!file || file.status !== "ready") return fail(404, "ese archivo ya no está");
+  if (!file || file.status !== "ready") return fail(404, M.fileGone);
 
   files.countDownload(file);
   rooms.touch(room);
@@ -185,8 +188,10 @@ function download(ticketId: string): Response {
   });
 }
 
-const broadcastFiles = (roomId: string) =>
+function broadcastFiles(roomId: string): void {
   bus.publish(rooms.roomTopic(roomId), { type: "files", items: files.listFiles(roomId) });
+  rooms.broadcastUsage(roomId);
+}
 
 // ── static files ─────────────────────────────────────────────────────────────
 
@@ -234,14 +239,14 @@ const server = Bun.serve<SocketData, string>({
 
     if (path === "/ws") {
       const channel = resolveChannel(req, url);
-      if (!channel) return fail(401, "no autorizado");
+      if (!channel) return fail(401, msg(langOf(req)).unauthorized);
       if (srv.upgrade(req, { data: { channel } })) return undefined as unknown as Response;
-      return fail(400, "no se pudo abrir el WebSocket");
+      return fail(400, msg(langOf(req)).noSocket);
     }
 
     if (path === "/api/events") {
       const channel = resolveChannel(req, url);
-      if (!channel) return fail(401, "no autorizado");
+      if (!channel) return fail(401, msg(langOf(req)).unauthorized);
       return sseResponse(channel);
     }
 
@@ -282,13 +287,15 @@ const server = Bun.serve<SocketData, string>({
 
 async function api(req: Request, url: URL, path: string, ip: string): Promise<Response> {
   const userAgent = req.headers.get("user-agent") ?? "";
+  const lang = langOf(req);
+  const M = msg(lang);
 
   if (path === "/api/room" && req.method === "POST") {
     if (!take(`create:${ip}`, LIMITS.roomsPerIpPerHour, 60 * 60 * 1000)) {
-      return fail(429, "demasiadas salas creadas desde esta red, espera un rato");
+      return fail(429, M.tooManyRooms);
     }
     if (rooms.roomCount() >= LIMITS.concurrentRooms) {
-      return fail(503, "no hay salas libres en este momento");
+      return fail(503, M.noRoomsLeft);
     }
     const { room, token } = rooms.createRoom(ip, userAgent);
     return json({ code: room.code, token, expiresAt: rooms.expiresAt(room) });
@@ -299,37 +306,39 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
     // Without this limit the code space can be swept in minutes: it is the gap
     // that the per-IP room count does not cover.
     if (!take(`join:${ip}`, LIMITS.joinAttemptsPerIpPer5Min, 5 * 60 * 1000)) {
-      return fail(429, "demasiados intentos, espera un momento");
+      return fail(429, M.tooManyJoins);
     }
     const code = joinMatch[1]!.toLowerCase();
-    if (!CODE_RE.test(code)) return fail(400, "código inválido");
+    if (!CODE_RE.test(code)) return fail(400, M.badCode);
 
     const room = rooms.roomByCode(code);
-    if (!room) return fail(404, "esa sala no existe o ya expiró");
+    if (!room) return fail(404, M.noRoom);
 
     const result = rooms.join(room, ip, userAgent);
-    if (result.status === "full") return fail(409, "la sala está llena");
+    if (result.status === "full") return fail(409, M.roomCrowded);
     return json(result);
   }
 
   const ticketMatch = path.match(/^\/api\/download\/([A-Za-z0-9_-]{1,64})$/);
-  if (ticketMatch && req.method === "GET") return download(ticketMatch[1]!);
+  if (ticketMatch && req.method === "GET") return download(ticketMatch[1]!, lang);
 
   const auth = authenticate(req, url);
-  if (!auth) return fail(401, "no autorizado");
+  if (!auth) return fail(401, M.unauthorized);
   const { room, member } = auth;
   const isOwner = member.role === "owner";
   const body = req.method === "POST" ? await readJson(req) : {};
 
   if (path === "/api/file" && req.method === "POST") {
     if (typeof body.name !== "string" || typeof body.size !== "number") {
-      return fail(400, "petición inválida");
+      return fail(400, M.badRequest);
     }
     const result = await files.createFile(room.id, member.id, body.name, body.size);
     if (!result.ok) {
-      if (result.reason === "too_many") return fail(409, "la sala ya tiene el máximo de archivos");
-      if (result.reason === "quota") return fail(413, "la sala llegó a su límite de tráfico");
-      return fail(413, "el archivo supera el límite de la sala");
+      if (result.reason === "too_many") return fail(409, M.tooManyFiles);
+      if (result.reason === "full") return fail(413, M.full);
+      if (result.reason === "quota") return fail(413, M.overQuota);
+      if (result.reason === "disk") return fail(507, M.noDisk);
+      return fail(413, M.fileTooBig);
     }
     const { file } = result;
     rooms.touch(room);
@@ -340,17 +349,17 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
   const fileMatch = path.match(/^\/api\/file\/([^/]+)(\/.*)?$/);
   if (fileMatch) {
     const file = files.fileById(room.id, fileMatch[1]!);
-    if (!file) return fail(404, "ese archivo ya no está");
+    if (!file) return fail(404, M.fileGone);
     const rest = fileMatch[2] ?? "";
 
     const chunkMatch = rest.match(/^\/chunk\/(\d+)$/);
     if (chunkMatch && req.method === "PUT") {
-      if (file.status === "ready") return fail(409, "ese archivo ya está completo");
+      if (file.status === "ready") return fail(409, M.fileComplete);
       const result = await files.writeChunk(file, Number(chunkMatch[1]), await req.arrayBuffer());
       if (!result.ok) {
         return result.reason === "quota"
-          ? fail(413, "la sala llegó a su límite de tráfico")
-          : fail(400, "trozo fuera de rango");
+          ? fail(413, M.overQuota)
+          : fail(400, M.chunkOutOfRange);
       }
       rooms.touch(room);
       broadcastFiles(room.id);
@@ -373,22 +382,22 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
       broadcastFiles(room.id);
       if (!result.ok) {
         return result.reason === "incomplete"
-          ? fail(409, "faltan trozos por subir")
-          : fail(422, "el archivo llegó corrupto, vuelve a subirlo");
+          ? fail(409, M.missingChunks)
+          : fail(422, M.corrupt);
       }
       rooms.touch(room);
       return json({ ok: true, sha256: result.file.sha256 });
     }
 
     if (rest === "/remove" && req.method === "POST") {
-      if (!isOwner && file.author_id !== member.id) return fail(403, "solo quien lo subió o el dueño lo borra");
+      if (!isOwner && file.author_id !== member.id) return fail(403, M.ownerOrAuthorRemoves);
       await files.removeFile(file);
       broadcastFiles(room.id);
       return json({ ok: true });
     }
 
     if (rest === "/ticket" && req.method === "POST") {
-      if (file.status !== "ready") return fail(409, "el archivo todavía se está subiendo");
+      if (file.status !== "ready") return fail(409, M.fileUploading);
       return json({ ticket: issueTicket(room.id, file.id) });
     }
   }
@@ -399,20 +408,25 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
 
     case "/api/text": {
       if (typeof body.text !== "string" || typeof body.baseRev !== "number") {
-        return fail(400, "petición inválida");
+        return fail(400, M.badRequest);
       }
       const result = rooms.setText(room, body.text, body.baseRev, member.id, body.force === true);
       if (result.ok) return json({ rev: result.rev });
-      if (result.reason === "too_large") return fail(413, "el texto supera el límite de la sala");
-      return json({ error: "conflict", text: result.text, rev: result.rev }, 409);
+      if (result.reason === "conflict") {
+        return json({ error: "conflict", text: result.text, rev: result.rev }, 409);
+      }
+      return fail(413, result.reason === "full" ? M.full : M.textTooBig);
     }
 
-    case "/api/pin":
-      return rooms.pinText(room) ? json({ ok: true }) : fail(409, "no hay nada nuevo que fijar");
+    case "/api/pin": {
+      const result = rooms.pinText(room);
+      if (result === "full") return fail(413, M.full);
+      return result === "ok" ? json({ ok: true }) : fail(409, M.nothingToPin);
+    }
 
     case "/api/entry/remove": {
-      if (typeof body.id !== "number") return fail(400, "petición inválida");
-      return rooms.removeEntry(room, body.id) ? json({ ok: true }) : fail(404, "no encontrada");
+      if (typeof body.id !== "number") return fail(400, M.badRequest);
+      return rooms.removeEntry(room, body.id) ? json({ ok: true }) : fail(404, M.notFound);
     }
 
     case "/api/clear":
@@ -423,44 +437,44 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
       return json({ ok: true });
 
     case "/api/approve": {
-      if (!isOwner) return fail(403, "solo el dueño aprueba");
-      if (typeof body.pendingId !== "string") return fail(400, "petición inválida");
+      if (!isOwner) return fail(403, M.ownerApproves);
+      if (typeof body.pendingId !== "string") return fail(400, M.badRequest);
       return rooms.approve(room, body.pendingId)
         ? json({ ok: true })
-        : fail(404, "esa solicitud ya no está disponible");
+        : fail(404, M.requestGone);
     }
 
     case "/api/reject": {
-      if (!isOwner) return fail(403, "solo el dueño rechaza");
-      if (typeof body.pendingId !== "string") return fail(400, "petición inválida");
-      return rooms.reject(room, body.pendingId) ? json({ ok: true }) : fail(404, "no encontrada");
+      if (!isOwner) return fail(403, M.ownerRejects);
+      if (typeof body.pendingId !== "string") return fail(400, M.badRequest);
+      return rooms.reject(room, body.pendingId) ? json({ ok: true }) : fail(404, M.notFound);
     }
 
     case "/api/kick": {
-      if (!isOwner) return fail(403, "solo el dueño expulsa");
-      if (typeof body.memberId !== "string") return fail(400, "petición inválida");
-      return rooms.kick(room, body.memberId) ? json({ ok: true }) : fail(404, "no encontrado");
+      if (!isOwner) return fail(403, M.ownerKicks);
+      if (typeof body.memberId !== "string") return fail(400, M.badRequest);
+      return rooms.kick(room, body.memberId) ? json({ ok: true }) : fail(404, M.memberNotFound);
     }
 
     case "/api/rotate": {
-      if (!isOwner) return fail(403, "solo el dueño rota el código");
+      if (!isOwner) return fail(403, M.ownerRotates);
       return json({ code: rooms.rotateCode(room) });
     }
 
     case "/api/auto-approve": {
-      if (!isOwner) return fail(403, "solo el dueño lo activa");
+      if (!isOwner) return fail(403, M.ownerEnables);
       const minutes = typeof body.minutes === "number" ? Math.min(body.minutes, 5) : 0;
       return json({ until: rooms.setAutoApprove(room, minutes) });
     }
 
     case "/api/close": {
-      if (!isOwner) return fail(403, "solo el dueño cierra la sala");
+      if (!isOwner) return fail(403, M.ownerCloses);
       rooms.destroyRoom(room, "closed");
       return json({ ok: true });
     }
   }
 
-  return fail(404, "ruta desconocida");
+  return fail(404, M.unknownRoute);
 }
 
 setInterval(() => {
@@ -474,5 +488,5 @@ setInterval(() => bus.heartbeat(), 25_000);
 
 console.log(
   `cloudnt listening on http://${server.hostname}:${server.port}` +
-    `${TRUST_PROXY ? "  (trusting x-forwarded-for)" : ""}${DEV ? "  (client on :5173)" : ""}`,
+    `${TRUST_PROXY ? `  (trusting ${CLIENT_IP_HEADER})` : ""}${DEV ? "  (client on :5173)" : ""}`,
 );

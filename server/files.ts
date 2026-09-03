@@ -1,6 +1,7 @@
 import { mkdir, open, rm, stat } from "node:fs/promises";
 import { db, type FileRow } from "./db.ts";
-import { CHUNK_SIZE, FILES_DIR, LIMITS } from "./config.ts";
+import { CHUNK_SIZE, DISK_BYTES, FILES_DIR, LIMITS } from "./config.ts";
+import { fits } from "./usage.ts";
 
 /**
  * Ids are CSPRNG base64url, but they arrive from the URL, so they are matched
@@ -76,11 +77,24 @@ function addBytes(roomId: string, n: number): void {
   db.run("UPDATE rooms SET bytes_moved = bytes_moved + ? WHERE id = ?", [n, roomId]);
 }
 
+/**
+ * Sums what was declared, not what landed, so the space is booked the moment a
+ * file is announced. Measuring instead would let any number of creations race
+ * through the same free space and only collide once the bytes arrive, with the
+ * disk already full. Chunks can never exceed the declaration: writeChunk pins
+ * each one to expectedChunkLength.
+ */
+function reservedBytes(): number {
+  const row = db.query("SELECT COALESCE(SUM(size), 0) AS n FROM files").get() as { n: number };
+  return row.n;
+}
+
+
 // ── upload ───────────────────────────────────────────────────────────────────
 
 export type CreateResult =
   | { ok: true; file: FileRow }
-  | { ok: false; reason: "too_large" | "too_many" | "quota" };
+  | { ok: false; reason: "too_large" | "too_many" | "quota" | "full" | "disk" };
 
 export async function createFile(
   roomId: string,
@@ -96,7 +110,9 @@ export async function createFile(
     n: number;
   };
   if (count.n >= LIMITS.filesPerRoom) return { ok: false, reason: "too_many" };
+  if (!fits(roomId, size)) return { ok: false, reason: "full" };
   if (bytesMoved(roomId) + size > LIMITS.bytesPerRoom) return { ok: false, reason: "quota" };
+  if (reservedBytes() + size > DISK_BYTES) return { ok: false, reason: "disk" };
 
   const file: FileRow = {
     id: newId(),

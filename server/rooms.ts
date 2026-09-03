@@ -1,6 +1,7 @@
 import { db, type HistoryRow, type MemberRow, type RoomRow } from "./db.ts";
 import * as bus from "./bus.ts";
 import * as files from "./files.ts";
+import * as usage from "./usage.ts";
 import { makeFingerprint } from "./fingerprint.ts";
 import {
   CODE_ALPHABET,
@@ -379,20 +380,21 @@ function alreadyPinned(roomId: string, content: string): boolean {
 }
 
 /**
- * Saves the previous text to history only when it was replaced from scratch —
- * pasting over it or clearing it. Incremental typing preserves the prefix, so
- * it does not pollute the ten slots with intermediate states.
+ * The previous text goes to history only when it was replaced from scratch —
+ * pasted over or cleared. Incremental typing preserves the prefix, so it does
+ * not pollute the ten slots with intermediate states.
  */
-function snapshotIfReplaced(roomId: string, previous: string, next: string): boolean {
+function replacesText(roomId: string, previous: string, next: string): boolean {
   if (previous.trim() === "") return false;
   const anchor = previous.slice(0, Math.min(24, previous.length));
   if (next.includes(anchor)) return false;
+  return !alreadyPinned(roomId, previous);
+}
 
-  if (alreadyPinned(roomId, previous)) return false;
-
+function pushHistory(roomId: string, content: string): void {
   db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
     roomId,
-    previous,
+    content,
     Date.now(),
   ]);
   db.run(
@@ -400,13 +402,16 @@ function snapshotIfReplaced(roomId: string, previous: string, next: string): boo
        (SELECT id FROM history WHERE room_id = ?1 ORDER BY id DESC LIMIT ?2)`,
     [roomId, LIMITS.historyEntries],
   );
-  return true;
+}
+
+export function broadcastUsage(roomId: string): void {
+  bus.publish(roomTopic(roomId), { type: "usage", ...usage.roomUsage(roomId) });
 }
 
 export type SetTextResult =
   | { ok: true; rev: number }
   | { ok: false; reason: "conflict"; text: string; rev: number }
-  | { ok: false; reason: "too_large" };
+  | { ok: false; reason: "too_large" | "full" };
 
 export function setText(
   room: RoomRow,
@@ -427,14 +432,22 @@ export function setText(
   }
   if (text === current.text) return { ok: true, rev: current.rev };
 
-  const historyChanged = snapshotIfReplaced(room.id, current.text, text);
+  // The old text only frees its bytes when it is overwritten outright; when it
+  // is kept as an entry the room pays for both at once.
+  const snapshots = replacesText(room.id, current.text, text);
+  const growth =
+    Buffer.byteLength(text, "utf8") - (snapshots ? 0 : Buffer.byteLength(current.text, "utf8"));
+  if (!usage.fits(room.id, growth)) return { ok: false, reason: "full" };
+
+  if (snapshots) pushHistory(room.id, current.text);
   const rev = current.rev + 1;
   db.run("UPDATE rooms SET text = ?, rev = ? WHERE id = ?", [text, rev, room.id]);
 
   bus.publish(roomTopic(room.id), { type: "text", text, rev, authorId });
-  if (historyChanged) {
+  if (snapshots) {
     bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
   }
+  broadcastUsage(room.id);
   touch(room);
   return { ok: true, rev };
 }
@@ -444,31 +457,27 @@ export function setText(
  * when a paste replaces the previous one, so without this there is no way to
  * keep two texts side by side without overwriting one of them first.
  */
-export function pinText(room: RoomRow): boolean {
+export function pinText(room: RoomRow): "ok" | "nothing" | "full" {
   const current = db.query("SELECT text FROM rooms WHERE id = ?").get(room.id) as { text: string };
-  if (current.text.trim() === "") return false;
+  if (current.text.trim() === "") return "nothing";
+  if (alreadyPinned(room.id, current.text)) return "nothing";
 
-  if (alreadyPinned(room.id, current.text)) return false;
+  // The text stays in the editor as well as landing on the list, so pinning
+  // costs a second copy of it.
+  if (!usage.fits(room.id, Buffer.byteLength(current.text, "utf8"))) return "full";
 
-  db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
-    room.id,
-    current.text,
-    Date.now(),
-  ]);
-  db.run(
-    `DELETE FROM history WHERE room_id = ?1 AND id NOT IN
-       (SELECT id FROM history WHERE room_id = ?1 ORDER BY id DESC LIMIT ?2)`,
-    [room.id, LIMITS.historyEntries],
-  );
+  pushHistory(room.id, current.text);
   bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
+  broadcastUsage(room.id);
   touch(room);
-  return true;
+  return "ok";
 }
 
 export function removeEntry(room: RoomRow, id: number): boolean {
   const result = db.run("DELETE FROM history WHERE room_id = ? AND id = ?", [room.id, id]);
   if (result.changes === 0) return false;
   bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
+  broadcastUsage(room.id);
   touch(room);
   return true;
 }
@@ -485,6 +494,7 @@ export function clearRoom(room: RoomRow, authorId: string): number {
 
   bus.publish(roomTopic(room.id), { type: "text", text: "", rev, authorId });
   bus.publish(roomTopic(room.id), { type: "history", items: [] });
+  broadcastUsage(room.id);
   touch(room);
   return rev;
 }
@@ -507,6 +517,7 @@ export function snapshot(room: RoomRow, member: MemberRow) {
     members: roster(room.id),
     history: historyOf(room.id),
     files: files.listFiles(room.id),
+    usage: usage.roomUsage(room.id),
     pending:
       member.role === "owner"
         ? pendingsOf(room.id).map((p) => ({
