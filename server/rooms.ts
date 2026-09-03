@@ -409,15 +409,18 @@ const plainOf = (html: string) =>
     .trim();
 
 /**
- * The previous text goes to history only when it was replaced from scratch —
- * pasted over or cleared. Incremental typing preserves the prefix, so it does
- * not pollute the list with intermediate states. The comparison ignores tags:
- * markup closes right after the first characters, so a raw prefix would stop
- * matching on the very next keystroke.
+ * The previous text goes to history only when something else was pasted over
+ * it. Incremental typing preserves the prefix, so it does not pollute the list
+ * with intermediate states. The comparison ignores tags: markup closes right
+ * after the first characters, so a raw prefix would stop matching on the very
+ * next keystroke.
  */
 function replacesText(roomId: string, previous: string, next: string): boolean {
   const before = plainOf(previous);
   if (before === "") return false;
+  // Emptying the editor by hand is not a replacement, it is a member throwing
+  // the text away. Saving it anyway answers the question the New button asks.
+  if (plainOf(next) === "") return false;
   const anchor = before.slice(0, Math.min(24, before.length));
   if (plainOf(next).includes(anchor)) return false;
   return !alreadyPinned(roomId, previous);
@@ -465,7 +468,7 @@ export function setText(
   room: RoomRow,
   text: string,
   baseRev: number,
-  authorId: string,
+  origin: string,
   force: boolean,
 ): SetTextResult {
   if (Buffer.byteLength(text, "utf8") > LIMITS.textBytesPerRoom) {
@@ -506,7 +509,7 @@ export function setText(
     else listChanged = true;
   }
 
-  bus.publish(roomTopic(room.id), { type: "text", text, rev, authorId });
+  bus.publish(roomTopic(room.id), { type: "text", text, rev, origin });
   if (listChanged) {
     bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
   }
@@ -527,7 +530,7 @@ export function openEntry(
   room: RoomRow,
   id: number | null,
   pin: boolean,
-  authorId: string,
+  origin: string,
 ): OpenResult {
   if (pin && pinText(room) === "full") return { ok: false, reason: "full" };
 
@@ -540,7 +543,7 @@ export function openEntry(
 
   const rev = current.rev + 1;
   db.run("UPDATE rooms SET text = ?, rev = ?, editing_id = ? WHERE id = ?", [text, rev, id, room.id]);
-  bus.publish(roomTopic(room.id), { type: "text", text, rev, authorId });
+  bus.publish(roomTopic(room.id), { type: "text", text, rev, origin });
   bus.publish(roomTopic(room.id), { type: "editing", id });
   broadcastUsage(room.id);
   touch(room);
@@ -583,7 +586,7 @@ export function removeEntry(room: RoomRow, id: number): boolean {
 }
 
 /** The only immediate and irreversible deletion: the emergency exit. */
-export function clearRoom(room: RoomRow, authorId: string): number {
+export function clearRoom(room: RoomRow, origin: string): number {
   const current = db.query("SELECT text, rev FROM rooms WHERE id = ?").get(room.id) as {
     text: string;
     rev: number;
@@ -592,7 +595,7 @@ export function clearRoom(room: RoomRow, authorId: string): number {
   db.run("UPDATE rooms SET text = '', rev = ?, editing_id = NULL WHERE id = ?", [rev, room.id]);
   db.run("DELETE FROM history WHERE room_id = ?", [room.id]);
 
-  bus.publish(roomTopic(room.id), { type: "text", text: "", rev, authorId });
+  bus.publish(roomTopic(room.id), { type: "text", text: "", rev, origin });
   bus.publish(roomTopic(room.id), { type: "editing", id: null });
   bus.publish(roomTopic(room.id), { type: "history", items: [] });
   broadcastUsage(room.id);

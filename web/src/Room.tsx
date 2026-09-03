@@ -2,6 +2,7 @@ import { useEffect, useMemo, useReducer, useRef, useState } from "preact/hooks";
 import * as api from "./api.ts";
 import {
   ApiError,
+  CLIENT_ID,
   type FileItem,
   type HistoryItem,
   type Member,
@@ -63,6 +64,13 @@ type State = {
   serverText: string;
   serverRev: number;
   draft: string;
+  /**
+   * Counts the drafts that did not come from the editor. Typing outruns the
+   * render, so the effect cannot tell an echo from a remote change by comparing
+   * text — it would repaint stale text over what is being typed and drop the
+   * caret with it. Only a bump here repaints.
+   */
+  repaint: number;
   /** The history entry the editor is writing into, or null for a loose draft. */
   editingId: number | null;
   conflict: { text: string; rev: number } | null;
@@ -79,7 +87,8 @@ type State = {
 
 type Action =
   | { type: "snapshot"; snap: Snapshot }
-  | { type: "draft"; text: string }
+  /** `external` marks a draft the editor has to be repainted with. */
+  | { type: "draft"; text: string; external?: boolean }
   | { type: "commit"; text: string; rev: number }
   | { type: "conflict"; text: string; rev: number }
   | { type: "takeTheirs" }
@@ -95,6 +104,7 @@ const initial: State = {
   serverText: "",
   serverRev: 0,
   draft: "",
+  repaint: 0,
   editingId: null,
   conflict: null,
   members: [],
@@ -134,11 +144,21 @@ function reducer(state: State, action: Action): State {
       if (state.ready && isDirty(state) && snap.text !== state.serverText) {
         return { ...base, conflict: { text: snap.text, rev: snap.rev } };
       }
-      return { ...base, serverText: snap.text, serverRev: snap.rev, draft: snap.text };
+      return {
+        ...base,
+        serverText: snap.text,
+        serverRev: snap.rev,
+        draft: snap.text,
+        repaint: state.repaint + 1,
+      };
     }
 
     case "draft":
-      return { ...state, draft: action.text };
+      return {
+        ...state,
+        draft: action.text,
+        repaint: action.external ? state.repaint + 1 : state.repaint,
+      };
 
     case "commit":
       return { ...state, serverText: action.text, serverRev: action.rev };
@@ -153,6 +173,7 @@ function reducer(state: State, action: Action): State {
             serverText: state.conflict.text,
             serverRev: state.conflict.rev,
             draft: state.conflict.text,
+            repaint: state.repaint + 1,
             conflict: null,
           }
         : state;
@@ -169,9 +190,15 @@ function reducer(state: State, action: Action): State {
         case "text": {
           const text = String(e.text);
           const rev = Number(e.rev);
-          if (e.authorId === state.memberId) return { ...state, serverText: text, serverRev: rev };
+          if (e.origin === CLIENT_ID) return { ...state, serverText: text, serverRev: rev };
           if (isDirty(state)) return { ...state, conflict: { text, rev } };
-          return { ...state, serverText: text, serverRev: rev, draft: text };
+          return {
+            ...state,
+            serverText: text,
+            serverRev: rev,
+            draft: text,
+            repaint: state.repaint + 1,
+          };
         }
         case "roster":
           return { ...state, members: e.members as Member[] };
@@ -237,8 +264,6 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   const [stackWidth, setStackWidth] = useState(() => clampStack(savedStackWidth() ?? STACK_DEFAULT));
   const [clearAfterPin, setClearAfterPin] = useState(clearsOnPin);
   const editorRef = useRef<HTMLDivElement>(null);
-  /** What this tab last typed, so a remote update is told apart from an echo. */
-  const lastTyped = useRef("");
   const pickerRef = useRef<HTMLInputElement>(null);
   const resizeFrom = useRef<{ x: number; width: number } | null>(null);
   /** The picked File never leaves the tab: it is what a resume reads from. */
@@ -287,14 +312,13 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   }, [expiringNow, remaining, state.code]);
 
   /* Repainting on every keystroke would drop the caret, so the editor is only
-     rewritten when the text did not come from this tab. */
+     rewritten for text it did not produce itself. */
   useEffect(() => {
     const el = editorRef.current;
-    if (!el || state.draft === lastTyped.current) return;
-    lastTyped.current = state.draft;
+    if (!el || state.repaint === 0) return;
     el.innerHTML = sanitize(state.draft);
     paintImages();
-  }, [state.draft]);
+  }, [state.repaint]);
 
   useEffect(() => {
     const urls = blobs.current;
@@ -421,7 +445,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
       const { text, rev } = await api.setEditing(token, id, pin);
       // Own echoes never touch the draft, so the tab that asked for the swap has
       // to move its own editor.
-      dispatch({ type: "draft", text });
+      dispatch({ type: "draft", text, external: true });
       dispatch({ type: "commit", text, rev });
       setTab("text");
     });
@@ -582,9 +606,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   const commitEditor = () => {
     const el = editorRef.current;
     if (!el) return;
-    const html = serialize(el);
-    lastTyped.current = html;
-    dispatch({ type: "draft", text: html });
+    dispatch({ type: "draft", text: serialize(el) });
     paintImages();
   };
 
@@ -841,7 +863,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
                           const { rev } = await api.clearRoom(token);
                           // Own echo does not update the draft, to avoid overwriting ongoing
                           // typing. Clearing is the exception: the editor must end up empty.
-                          dispatch({ type: "draft", text: "" });
+                          dispatch({ type: "draft", text: "", external: true });
                           dispatch({ type: "commit", text: "", rev });
                           notify(t.room.wiped);
                         }),

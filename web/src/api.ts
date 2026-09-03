@@ -1,5 +1,12 @@
 import { currentLang, strings } from "./i18n.ts";
 
+/**
+ * Identifies this tab, not this member: the same browser holds one token per
+ * room, so two tabs are the same member and would each take the other's writes
+ * for an echo of their own — and answer them with a write back, forever.
+ */
+export const CLIENT_ID = crypto.randomUUID();
+
 export const CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 export const CODE_LENGTH = 5;
 
@@ -74,6 +81,7 @@ async function request<T>(path: string, init: RequestInit & { token?: string } =
   // The app's own choice, not the browser's: they differ as soon as anyone uses
   // the selector, and the errors end up in the same toasts as everything else.
   headers.set("x-lang", currentLang());
+  headers.set("x-client", CLIENT_ID);
 
   const res = await fetch(path, { ...init, headers });
   const payload = (await res.json().catch(() => ({}))) as Record<string, unknown>;

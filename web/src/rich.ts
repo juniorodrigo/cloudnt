@@ -54,7 +54,10 @@ export function sanitize(html: string): string {
 export function serialize(el: HTMLElement): string {
 	const clone = el.cloneNode(true) as HTMLElement;
 	for (const img of clone.querySelectorAll("img")) img.removeAttribute("src");
-	return sanitize(clone.innerHTML);
+	const html = sanitize(clone.innerHTML);
+	// An editor emptied by hand keeps a <br>, which the room would store and be
+	// charged for.
+	return isEmpty(html) ? "" : html;
 }
 
 export function imageTag(fileId: string, name: string): string {

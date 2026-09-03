@@ -408,6 +408,10 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
     }
   }
 
+  // Which tab wrote, not which member: a member with two tabs open has to be
+  // told apart from itself, or each tab answers the other's echo with a write.
+  const origin = req.headers.get("x-client") || member.id;
+
   switch (path) {
     case "/api/state":
       return json(rooms.snapshot(room, member));
@@ -416,7 +420,7 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
       if (typeof body.text !== "string" || typeof body.baseRev !== "number") {
         return fail(400, M.badRequest);
       }
-      const result = rooms.setText(room, body.text, body.baseRev, member.id, body.force === true);
+      const result = rooms.setText(room, body.text, body.baseRev, origin, body.force === true);
       if (result.ok) return json({ rev: result.rev });
       if (result.reason === "conflict") {
         return json({ error: "conflict", text: result.text, rev: result.rev }, 409);
@@ -432,7 +436,7 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
 
     case "/api/editing": {
       if (body.id !== null && typeof body.id !== "number") return fail(400, M.badRequest);
-      const result = rooms.openEntry(room, body.id, body.pin === true, member.id);
+      const result = rooms.openEntry(room, body.id, body.pin === true, origin);
       if (result.ok) return json({ text: result.text, rev: result.rev });
       return result.reason === "full" ? fail(413, M.full) : fail(404, M.notFound);
     }
@@ -443,7 +447,7 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
     }
 
     case "/api/clear":
-      return json({ rev: rooms.clearRoom(room, member.id) });
+      return json({ rev: rooms.clearRoom(room, origin) });
 
     case "/api/keepalive":
       rooms.touch(room);
