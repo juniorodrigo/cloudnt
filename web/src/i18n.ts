@@ -151,7 +151,7 @@ const es = {
 		unsavedTitle: "Hay texto sin guardar",
 		unsavedBody:
 			"Lo que hay en el editor no está en la lista de pegadas todavía. Si sigues, se reemplaza.",
-		saveAndOpen: "Guardarlo como pegada",
+		saveAndOpen: "Guardarlo",
 		discardText: "Descartarlo",
 		download: "Descargar",
 		downloadTip: "Alt+S · descarga el texto como archivo .txt",
@@ -394,7 +394,7 @@ const en: typeof es = {
 		openTag: "open",
 		unsavedTitle: "There is unsaved text",
 		unsavedBody: "What the editor holds is not on the paste list yet. Going on replaces it.",
-		saveAndOpen: "Save it as a paste",
+		saveAndOpen: "Save it",
 		discardText: "Discard it",
 		download: "Download",
 		downloadTip: "Alt+S · downloads the text as a .txt file",

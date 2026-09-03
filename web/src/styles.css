@@ -1688,8 +1688,11 @@ button {
   color: var(--ink-muted);
 }
 
+/* Wrapping rather than shrinking: a translation long enough to fill the row
+   drops to the next line instead of spilling out of the modal. */
 .modal-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 22px;
