@@ -4,15 +4,15 @@
 #
 #   ./scripts/install.sh
 #
-# Idempotent: re-run it after a `git pull` to rebuild and restart.
-# Override the port with PORT=8080 ./scripts/install.sh
+# Idempotent: re-run it after a `git pull` to rebuild and restart. Settings live
+# in /etc/cloudnt.env, which is written once and never overwritten.
 set -euo pipefail
 
 USER_NAME=cloudnt
 HOME_DIR=/opt/cloudnt
 BUN="$HOME_DIR/.bun/bin/bun"
 UNIT=/etc/systemd/system/cloudnt.service
-PORT="${PORT:-3067}"
+ENV_FILE=/etc/cloudnt.env
 APP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -29,10 +29,8 @@ as_app_user() {
 id "$USER_NAME" >/dev/null 2>&1 ||
 	adduser --system --group --home "$HOME_DIR" "$USER_NAME"
 
-if ! command -v curl >/dev/null || ! command -v unzip >/dev/null; then
-	apt-get update
-	apt-get install -y curl unzip
-fi
+command -v curl >/dev/null && command -v unzip >/dev/null ||
+	{ apt-get update && apt-get install -y curl unzip; }
 
 [ -x "$BUN" ] ||
 	as_app_user bash -c 'curl -fsSL https://bun.sh/install | bash'
@@ -47,12 +45,25 @@ git config --global --add safe.directory "$APP" 2>/dev/null || true
 as_app_user env -u NODE_ENV "$BUN" install --cwd "$APP"
 as_app_user env -u NODE_ENV "$BUN" run --cwd "$APP" build
 
-# An existing unit is left alone: by then it usually carries hand-added
-# Environment= lines, and an update would silently drop them.
-if [ -f "$UNIT" ] && [ "${FORCE:-}" != "1" ]; then
-	echo "$UNIT ya existe, no se toca (FORCE=1 para regenerarla)"
-else
-	cat >"$UNIT" <<EOF
+if [ ! -f "$ENV_FILE" ]; then
+	cat >"$ENV_FILE" <<EOF
+PORT=${PORT:-3067}
+# All interfaces: a service installed to be reached has to be reachable. Put it
+# back to 127.0.0.1 if you front it with a proxy on this same machine.
+CLOUDNT_HOST=0.0.0.0
+CLOUDNT_DATA=/var/lib/cloudnt
+# Adjust to the disk. 20 GB.
+CLOUDNT_DISK_BYTES=21474836480
+
+# Only with a real proxy in front that overwrites this header. Without one the
+# caller sets it and every per-IP quota stops existing.
+#CLOUDNT_TRUST_PROXY=1
+#CLOUDNT_CLIENT_IP_HEADER=x-forwarded-for
+EOF
+	echo "settings in $ENV_FILE"
+fi
+
+cat >"$UNIT" <<EOF
 [Unit]
 Description=cloudnt
 After=network.target
@@ -63,15 +74,11 @@ User=$USER_NAME
 Group=$USER_NAME
 WorkingDirectory=$APP
 ExecStart=$BUN run server/index.ts
-Restart=always
-RestartSec=2
-
+EnvironmentFile=$ENV_FILE
 # Without this the server answers 404 on anything that is not /api, by design.
 Environment=NODE_ENV=production
-Environment=PORT=$PORT
-Environment=CLOUDNT_DATA=/var/lib/cloudnt
-# Adjust to the disk. 20 GB.
-Environment=CLOUDNT_DISK_BYTES=21474836480
+Restart=always
+RestartSec=2
 
 # One descriptor per connection. The stock 1024 caps the room at ~900 clients.
 LimitNOFILE=65535
@@ -87,32 +94,26 @@ StateDirectory=cloudnt
 [Install]
 WantedBy=multi-user.target
 EOF
-	echo "unit escrita en $UNIT"
-fi
 
 systemctl daemon-reload
 systemctl reset-failed cloudnt 2>/dev/null || true
-systemctl enable --now cloudnt
+systemctl enable cloudnt >/dev/null
 systemctl restart cloudnt
 
-sleep 2
-# The unit may be an older one this run did not write, carrying its own port.
-running_port="$(sed -n 's/^Environment=PORT=//p' "$UNIT" | tail -1)"
-if [ -n "$running_port" ]; then
-	PORT="$running_port"
-fi
-code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" || true)"
-if [ "$code" = "200" ]; then
-	echo
-	echo "cloudnt corriendo en http://127.0.0.1:$PORT"
-	echo "Unit: $UNIT   Logs: journalctl -u cloudnt -f"
-	echo
-	echo "Si pones un proxy o un tunel delante, anade a la unit:"
-	echo "  Environment=CLOUDNT_TRUST_PROXY=1"
-	echo "  Environment=CLOUDNT_CLIENT_IP_HEADER=<la cabecera que escriba>"
-	echo "Sin eso las cuotas por IP se colapsan en una sola. Ver el paso 4 del README."
-else
+port="$(sed -n 's/^PORT=//p' "$ENV_FILE" | tail -1)"
+for _ in $(seq 20); do
+	code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
+	[ "$code" = "200" ] && break
+	sleep 1
+done
+
+if [ "$code" != "200" ]; then
 	echo "el servicio no responde (HTTP $code)" >&2
 	journalctl -u cloudnt -n 30 --no-pager >&2
 	exit 1
 fi
+
+echo
+echo "cloudnt escuchando en el puerto $port"
+echo "Ajustes: $ENV_FILE (tras editarlo: systemctl restart cloudnt)"
+echo "Logs:    journalctl -u cloudnt -f"
