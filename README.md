@@ -57,42 +57,31 @@ que no sea de API, a propósito, para que no haya duda de quién está sirviendo
 
 ## Despliegue
 
-Cuatro pasos, en orden, sobre Debian 13 o Ubuntu 24.04 y como `root`. Los tres
-primeros dejan la aplicación corriendo; el cuarto no da recetas, solo dice qué
-necesita el servidor de lo que decidas poner delante.
+Debian 13 o Ubuntu 24.04, como `root`. El script lo hace todo salvo publicar la
+aplicación, que es el paso 2 y es decisión tuya.
 
-Antes de empezar, mira [Dimensionar](#dimensionar) si vas a abrirlo al público.
+Si vas a abrirlo al público, mira antes [Dimensionar](#dimensionar).
 
-### 1. Crear el usuario e instalar Bun
-
-```sh
-adduser --system --group --home /opt/cloudnt cloudnt
-apt update && apt install -y git unzip
-sudo -u cloudnt bash -c 'curl -fsSL https://bun.sh/install | bash'
-```
-
-Bun queda en `/opt/cloudnt/.bun/bin/bun`.
-
-### 2. Clonar y compilar
+### 1. Instalar
 
 ```sh
-git clone <url-del-repo> /opt/cloudnt/app
-chown -R cloudnt:cloudnt /opt/cloudnt/app
-sudo -u cloudnt bash -c 'cd /opt/cloudnt/app && /opt/cloudnt/.bun/bin/bun install && /opt/cloudnt/.bun/bin/bun run build'
+git clone <url-del-repo> /var/www/cloudnt
+cd /var/www/cloudnt && ./scripts/install.sh
 ```
 
-Si clonas en otra ruta, cámbiala en los tres comandos de arriba y en el
-`WorkingDirectory` del paso 3.
+Crea el usuario `cloudnt`, instala Bun, compila el cliente, escribe la unit de
+systemd apuntando a donde hayas clonado, arranca el servicio y comprueba que
+responde. Funciona en cualquier ruta y es idempotente: vuelve a lanzarlo tras un
+`git pull` y recompila y reinicia.
 
-La ruta a `bun` va completa porque `cloudnt` es un usuario de sistema sin shell:
-su `PATH` no incluye `~/.bun/bin`. Y se despliega el árbol del repo entero, no un
-artefacto suelto, porque el servidor busca el cliente en `web/dist/` relativo a
-`server/index.ts`.
+El puerto sale 3067. Para otro: `PORT=8080 ./scripts/install.sh`.
 
-### 3. Crear el servicio
+Si ya existe una unit, la respeta y no la sobrescribe. Para regenerarla desde cero:
+`FORCE=1 ./scripts/install.sh`.
 
-Crea el archivo `/etc/systemd/system/cloudnt.service` — no existe todavía — con
-este contenido:
+Si prefieres hacerlo a mano, el script es corto y se lee de arriba abajo:
+[`scripts/install.sh`](scripts/install.sh). La unit que genera es esta, y está en
+`/etc/systemd/system/cloudnt.service`:
 
 ```ini
 [Unit]
@@ -103,24 +92,19 @@ After=network.target
 Type=simple
 User=cloudnt
 Group=cloudnt
-# La ruta donde clonaste en el paso 2. Si no coincide, systemd falla con
-# status=200/CHDIR antes siquiera de arrancar Bun.
-WorkingDirectory=/opt/cloudnt/app
+# Donde clonaste. Si no coincide, systemd falla con status=200/CHDIR antes
+# siquiera de arrancar Bun.
+WorkingDirectory=/var/www/cloudnt
 ExecStart=/opt/cloudnt/.bun/bin/bun run server/index.ts
 Restart=always
 RestartSec=2
 
 # Sin esto el servidor devuelve 404 en todo lo que no sea /api, a propósito.
 Environment=NODE_ENV=production
-# Por defecto son 3000. Si lo cambias, cámbialo también en lo que pongas delante.
 Environment=PORT=3067
-# Solo si pones algo delante: ver el paso 4, que es donde se decide la cabecera.
-# Sin nada delante, borra estas dos líneas.
-Environment=CLOUDNT_TRUST_PROXY=1
-Environment=CLOUDNT_CLIENT_IP_HEADER=x-forwarded-for
+Environment=CLOUDNT_DATA=/var/lib/cloudnt
 # Ajústalo a tu disco: aquí son 20 GB.
 Environment=CLOUDNT_DISK_BYTES=21474836480
-Environment=CLOUDNT_DATA=/var/lib/cloudnt
 
 # Un descriptor por conexión. Con los 1024 de serie el techo real son ~900 clientes.
 LimitNOFILE=65535
@@ -137,26 +121,24 @@ StateDirectory=cloudnt
 WantedBy=multi-user.target
 ```
 
-Arráncalo y comprueba que responde:
+Si algo falla, el script te deja los últimos 30 registros en pantalla. Para seguirlos:
+`journalctl -u cloudnt -f`.
 
-```sh
-systemctl daemon-reload && systemctl enable --now cloudnt
-curl -sI http://127.0.0.1:3067/   # 200 OK
-journalctl -u cloudnt -n 30
-```
+### 2. Exponerlo
 
-En este punto la aplicación funciona, escuchando solo en loopback. Publicarla es el
-paso 4.
-
-### 4. Exponerlo
-
-Cómo la publicas es decisión tuya: proxy inverso, túnel, o abrir el puerto si la
-máquina tiene IP pública. El servidor solo pide dos cosas de lo que pongas delante.
+El servicio escucha solo en loopback. Cómo lo publicas es decisión tuya: proxy inverso,
+túnel, o abrir el puerto si la máquina tiene IP pública. El servidor solo pide dos cosas
+de lo que pongas delante.
 
 **Que le diga la IP real del cliente.** Detrás de cualquier intermediario todas las
 peticiones llegan desde `127.0.0.1`, y las cuotas por IP se colapsan en un único cubo
-compartido por todo internet: 10 salas por hora en total. Para eso están
-`CLOUDNT_TRUST_PROXY=1` y `CLOUDNT_CLIENT_IP_HEADER` en la unit.
+compartido por todo internet: 10 salas por hora en total. Para arreglarlo, añade a la
+unit:
+
+```ini
+Environment=CLOUDNT_TRUST_PROXY=1
+Environment=CLOUDNT_CLIENT_IP_HEADER=x-forwarded-for
+```
 
 Pon en la segunda la cabecera que escriba tu intermediario, y comprueba que la
 **sobrescribe** en lugar de añadirse. El servidor lee el último elemento de la cadena,
@@ -164,8 +146,8 @@ así que una cabecera a la que el cliente pueda anteponer su propio valor deja l
 cuotas en nada: basta un valor nuevo por petición para probar códigos sin límite. Con
 Cloudflare delante la que cumple eso es `cf-connecting-ip`, no `x-forwarded-for`.
 
-Si no hay nada delante, **quita esas dos líneas de la unit**. Sin proxy la cabecera la
-controla quien llama.
+Si no hay nada delante, **no las pongas**: sin proxy la cabecera la controla quien
+llama, y basta un valor nuevo por petición para saltarse toda cuota.
 
 **Que no estorbe a las conexiones largas.** El resto ya está resuelto en el código: el
 latido del WebSocket va cada 25 s, por debajo del corte de inactividad habitual de
@@ -208,7 +190,7 @@ esté, baja `fileBytes` en `server/config.ts` a algo que tu subida tolere.
 ## Configuración
 
 Referencia de las variables de entorno. Todas tienen un valor por defecto sensato, y
-la unit del paso 3 ya trae puestas las que importan en producción.
+la unit que genera el instalador ya trae puestas las que importan en producción.
 
 | Variable | Por defecto | Para qué |
 |---|---|---|
@@ -262,12 +244,12 @@ ese momento, y nada más.
 **Actualizar:**
 
 ```sh
-sudo -u cloudnt bash -c 'cd /opt/cloudnt/app && git pull \
-  && /opt/cloudnt/.bun/bin/bun install && /opt/cloudnt/.bun/bin/bun run build'
-systemctl restart cloudnt
+cd /var/www/cloudnt && git pull && ./scripts/install.sh
 ```
 
-El reinicio corta las conexiones, pero el cliente reconecta solo y las salas viven en
+El instalador es idempotente: recompila y reinicia, y no toca la unit si ya existe,
+para no borrar los `Environment=` que le hayas añadido. El reinicio corta las
+conexiones, pero el cliente reconecta solo y las salas viven en
 SQLite. Lo que se pierde es estado en memoria y todo es prescindible: los tickets de
 descarga (30 s de vida) y las ventanas de rate limit.
 
