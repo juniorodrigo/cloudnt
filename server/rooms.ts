@@ -1,12 +1,12 @@
-import { db, type HistoryItem, type MemberRow, type RoomRow } from "./db.ts";
+import { db, type BlockItem, type MemberRow, type RoomRow } from "./db.ts";
 import * as bus from "./bus.ts";
 import * as files from "./files.ts";
 import * as usage from "./usage.ts";
 import { makeFingerprint } from "./fingerprint.ts";
 import {
+  BLOCK_PREVIEW_CHARS,
   CODE_ALPHABET,
   CODE_LENGTH,
-  HISTORY_PREVIEW_CHARS,
   LIMITS,
   PENDING_TTL_MS,
   REJECT_UNDO_MS,
@@ -128,24 +128,45 @@ export function membersOf(roomId: string): MemberRow[] {
 }
 
 /**
- * The list is unbounded now, so the entries travel as previews: shipping every
+ * The list is unbounded now, so the blocks travel as previews: shipping every
  * full body would put the whole room's text on the wire again on each change,
  * and on the initial snapshot of every member who joins.
  */
-export function historyOf(roomId: string): HistoryItem[] {
-  return db
+export function blocksOf(roomId: string): BlockItem[] {
+  const rows = db
     .query(
-      `SELECT id, created_at, LENGTH(CAST(content AS BLOB)) AS bytes, SUBSTR(content, 1, ?) AS preview
-         FROM history WHERE room_id = ? ORDER BY id DESC`,
+      `SELECT id, created_at, updated_at, rev, author_id, locked,
+              LENGTH(CAST(content AS BLOB)) AS bytes, SUBSTR(content, 1, ?) AS preview
+         FROM blocks WHERE room_id = ? ORDER BY id DESC`,
     )
-    .all(HISTORY_PREVIEW_CHARS, roomId) as HistoryItem[];
+    .all(BLOCK_PREVIEW_CHARS, roomId) as {
+    id: number;
+    created_at: number;
+    updated_at: number;
+    rev: number;
+    author_id: string;
+    locked: number;
+    bytes: number;
+    preview: string;
+  }[];
+  return rows.map((r) => ({
+    id: r.id,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    rev: r.rev,
+    bytes: r.bytes,
+    preview: r.preview,
+    locked: r.locked === 1,
+    authorId: r.author_id,
+  }));
 }
 
-export function historyContent(roomId: string, id: number): string | null {
-  const row = db.query("SELECT content FROM history WHERE room_id = ? AND id = ?").get(roomId, id) as
-    | { content: string }
-    | null;
-  return row?.content ?? null;
+export type BlockDoc = { id: number; content: string; rev: number; locked: number; author_id: string };
+
+export function blockById(roomId: string, id: number): BlockDoc | null {
+  return db
+    .query("SELECT id, content, rev, locked, author_id FROM blocks WHERE room_id = ? AND id = ?")
+    .get(roomId, id) as BlockDoc | null;
 }
 
 export function pendingsOf(roomId: string): Pending[] {
@@ -261,7 +282,6 @@ export function createRoom(ip: string, userAgent: string) {
     last_activity: now,
     auto_approve_until: 0,
     bytes_moved: 0,
-    editing_id: null,
   };
   db.run(
     "INSERT INTO rooms (id, code, text, rev, created_at, last_activity) VALUES (?, ?, '', 0, ?, ?)",
@@ -386,12 +406,12 @@ export function setAutoApprove(room: RoomRow, minutes: number): number {
 // ── text ─────────────────────────────────────────────────────────────────────
 
 /**
- * Restoring an entry into the editor and then pasting over it would otherwise
+ * Restoring a block into the editor and then pasting over it would otherwise
  * snapshot content that is already on the list.
  */
-function alreadyPinned(roomId: string, content: string): boolean {
+function alreadySaved(roomId: string, content: string): boolean {
   return (
-    db.query("SELECT 1 FROM history WHERE room_id = ? AND content = ? LIMIT 1").get(roomId, content) !==
+    db.query("SELECT 1 FROM blocks WHERE room_id = ? AND content = ? LIMIT 1").get(roomId, content) !==
     null
   );
 }
@@ -409,7 +429,7 @@ const plainOf = (html: string) =>
     .trim();
 
 /**
- * The previous text goes to history only when something else was pasted over
+ * The previous text is kept as a block only when something else was pasted over
  * it. Incremental typing preserves the prefix, so it does not pollute the list
  * with intermediate states. The comparison ignores tags: markup closes right
  * after the first characters, so a raw prefix would stop matching on the very
@@ -423,20 +443,21 @@ function replacesText(roomId: string, previous: string, next: string): boolean {
   if (plainOf(next) === "") return false;
   const anchor = before.slice(0, Math.min(24, before.length));
   if (plainOf(next).includes(anchor)) return false;
-  return !alreadyPinned(roomId, previous);
+  return !alreadySaved(roomId, previous);
 }
 
 /**
- * Nothing prunes the list: history counts against the room's storage quota like
+ * Nothing prunes the list: blocks count against the room's storage quota like
  * everything else, so it grows until the gigabyte runs out and the owner deletes
  * what they no longer need.
  */
-function pushHistory(roomId: string, content: string): number {
-  const result = db.run("INSERT INTO history (room_id, content, created_at) VALUES (?, ?, ?)", [
-    roomId,
-    content,
-    Date.now(),
-  ]);
+function insertBlock(roomId: string, content: string, authorId: string, locked: boolean): number {
+  const now = Date.now();
+  const result = db.run(
+    `INSERT INTO blocks (room_id, content, created_at, updated_at, rev, locked, author_id)
+     VALUES (?, ?, ?, ?, 0, ?, ?)`,
+    [roomId, content, now, now, locked ? 1 : 0, authorId],
+  );
   return Number(result.lastInsertRowid);
 }
 
@@ -444,160 +465,210 @@ export function broadcastUsage(roomId: string): void {
   bus.publish(roomTopic(roomId), { type: "usage", ...usage.roomUsage(roomId) });
 }
 
-/**
- * Which entry the editor is working on. It is room state rather than per-tab
- * because the editor is one shared buffer: a link private to a member would have
- * everyone else typing into that member's entry without knowing.
- */
-function linkEntry(roomId: string, id: number | null): void {
-  db.run("UPDATE rooms SET editing_id = ? WHERE id = ?", [id, roomId]);
-  bus.publish(roomTopic(roomId), { type: "editing", id });
+function broadcastBlocks(roomId: string): void {
+  bus.publish(roomTopic(roomId), { type: "blocks", items: blocksOf(roomId) });
 }
 
-type Editable = { text: string; rev: number; editing_id: number | null };
+type Draft = { text: string; rev: number };
 
-const liveText = (roomId: string) =>
-  db.query("SELECT text, rev, editing_id FROM rooms WHERE id = ?").get(roomId) as Editable;
+const liveDraft = (roomId: string) =>
+  db.query("SELECT text, rev FROM rooms WHERE id = ?").get(roomId) as Draft;
 
-export type SetTextResult =
+export type WriteResult =
   | { ok: true; rev: number }
   | { ok: false; reason: "conflict"; text: string; rev: number }
-  | { ok: false; reason: "too_large" | "full" };
+  | { ok: false; reason: "gone" | "locked" | "too_large" | "full" };
 
-export function setText(
+/**
+ * One entry point for both kinds of document: `blockId` names the target, so
+ * two devices can be writing to different ones at the same time and neither
+ * drags the other along. `null` is the shared draft the room starts on.
+ */
+export function write(
   room: RoomRow,
+  member: MemberRow,
+  blockId: number | null,
   text: string,
   baseRev: number,
   origin: string,
   force: boolean,
-): SetTextResult {
+): WriteResult {
   if (Buffer.byteLength(text, "utf8") > LIMITS.textBytesPerRoom) {
     return { ok: false, reason: "too_large" };
   }
-  const current = liveText(room.id);
+  return blockId === null
+    ? writeDraft(room, member, text, baseRev, origin, force)
+    : writeBlock(room, blockId, text, baseRev, origin, force);
+}
+
+function writeDraft(
+  room: RoomRow,
+  member: MemberRow,
+  text: string,
+  baseRev: number,
+  origin: string,
+  force: boolean,
+): WriteResult {
+  const current = liveDraft(room.id);
   if (!force && baseRev !== current.rev) {
     return { ok: false, reason: "conflict", text: current.text, rev: current.rev };
   }
   if (text === current.text) return { ok: true, rev: current.rev };
 
-  const editing = current.editing_id;
-  // With an entry open the text is already on the list, so there is nothing to
-  // snapshot: the edit belongs to that entry and is written into it below.
-  const snapshots = editing === null && replacesText(room.id, current.text, text);
+  const snapshots = replacesText(room.id, current.text, text);
   // The old text only frees its bytes when it is overwritten outright; when it
-  // is kept as an entry the room pays for both at once. An open entry holds the
-  // same bytes as the editor and is rewritten with it, so the change is paid
-  // for on both copies.
+  // is kept as a block the room pays for both at once.
   const before = snapshots ? 0 : Buffer.byteLength(current.text, "utf8");
-  const growth = (Buffer.byteLength(text, "utf8") - before) * (editing === null ? 1 : 2);
-  if (!usage.fits(room.id, growth)) return { ok: false, reason: "full" };
+  if (!usage.fits(room.id, Buffer.byteLength(text, "utf8") - before)) {
+    return { ok: false, reason: "full" };
+  }
 
-  if (snapshots) pushHistory(room.id, current.text);
+  if (snapshots) insertBlock(room.id, current.text, member.id, false);
   const rev = current.rev + 1;
   db.run("UPDATE rooms SET text = ?, rev = ? WHERE id = ?", [text, rev, room.id]);
 
-  let listChanged = snapshots;
-  if (editing !== null) {
-    const written = db.run("UPDATE history SET content = ? WHERE room_id = ? AND id = ?", [
-      text,
-      room.id,
-      editing,
-    ]);
-    // Another member can delete the entry mid-edit. The text stays where it is;
-    // only the link goes, and the editor falls back to an unsaved draft.
-    if (written.changes === 0) linkEntry(room.id, null);
-    else listChanged = true;
-  }
-
-  bus.publish(roomTopic(room.id), { type: "text", text, rev, origin });
-  if (listChanged) {
-    bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
-  }
+  bus.publish(roomTopic(room.id), { type: "draft", text, rev, origin });
+  if (snapshots) broadcastBlocks(room.id);
   broadcastUsage(room.id);
   touch(room);
   return { ok: true, rev };
 }
 
-export type OpenResult = { ok: true; text: string; rev: number } | { ok: false; reason: "gone" | "full" };
-
-/**
- * Loads a history entry into the editor, or starts an empty draft when id is
- * null. Whatever the editor held is dropped unless `pin` asks for it to be kept:
- * the choice belongs to the member and travels with the request so that saving
- * and replacing cannot half-happen.
- */
-export function openEntry(
+function writeBlock(
   room: RoomRow,
-  id: number | null,
-  pin: boolean,
+  id: number,
+  text: string,
+  baseRev: number,
   origin: string,
-): OpenResult {
-  if (pin && pinText(room) === "full") return { ok: false, reason: "full" };
+  force: boolean,
+): WriteResult {
+  const block = blockById(room.id, id);
+  if (!block) return { ok: false, reason: "gone" };
+  if (block.locked === 1) return { ok: false, reason: "locked" };
+  if (!force && baseRev !== block.rev) {
+    return { ok: false, reason: "conflict", text: block.content, rev: block.rev };
+  }
+  if (text === block.content) return { ok: true, rev: block.rev };
 
-  const text = id === null ? "" : historyContent(room.id, id);
-  if (text === null) return { ok: false, reason: "gone" };
-
-  const current = liveText(room.id);
-  const growth = Buffer.byteLength(text, "utf8") - Buffer.byteLength(current.text, "utf8");
+  const growth = Buffer.byteLength(text, "utf8") - Buffer.byteLength(block.content, "utf8");
   if (!usage.fits(room.id, growth)) return { ok: false, reason: "full" };
 
-  const rev = current.rev + 1;
-  db.run("UPDATE rooms SET text = ?, rev = ?, editing_id = ? WHERE id = ?", [text, rev, id, room.id]);
-  bus.publish(roomTopic(room.id), { type: "text", text, rev, origin });
-  bus.publish(roomTopic(room.id), { type: "editing", id });
+  const rev = block.rev + 1;
+  const now = Date.now();
+  db.run("UPDATE blocks SET content = ?, rev = ?, updated_at = ? WHERE id = ?", [text, rev, now, id]);
+
+  // The whole body travels so that everyone else can redraw the card from it;
+  // sending the list again on every keystroke would ship the entire room.
+  bus.publish(roomTopic(room.id), { type: "block", id, text, rev, updatedAt: now, origin });
   broadcastUsage(room.id);
   touch(room);
-  return { ok: true, text, rev };
+  return { ok: true, rev };
 }
 
+export type SaveResult =
+  /** `draftRev` so the caller knows where the draft it just emptied stands. */
+  | { ok: true; id: number; rev: number; draftRev: number }
+  | { ok: false; reason: "nothing" | "too_large" | "full" };
+
 /**
- * Pins the live text as an entry of its own. The automatic snapshot only fires
- * when a paste replaces the previous one, so without this there is no way to
- * keep two texts side by side without overwriting one of them first.
+ * Turns a text into a block of its own. The automatic snapshot only fires when
+ * a paste replaces the previous one, so without this there is no way to keep two
+ * texts side by side without overwriting one of them first.
  */
-export function pinText(room: RoomRow): "ok" | "nothing" | "full" {
-  const current = db.query("SELECT text FROM rooms WHERE id = ?").get(room.id) as { text: string };
-  if (current.text.trim() === "") return "nothing";
-  if (alreadyPinned(room.id, current.text)) return "nothing";
+export function saveBlock(
+  room: RoomRow,
+  member: MemberRow,
+  text: string,
+  locked: boolean,
+): SaveResult {
+  if (Buffer.byteLength(text, "utf8") > LIMITS.textBytesPerRoom) {
+    return { ok: false, reason: "too_large" };
+  }
+  if (plainOf(text) === "") return { ok: false, reason: "nothing" };
 
-  // The text stays in the editor as well as landing on the list, so pinning
-  // costs a second copy of it.
-  if (!usage.fits(room.id, Buffer.byteLength(current.text, "utf8"))) return "full";
+  // Saving what the draft holds moves it rather than copying it: the block is
+  // where the text lives from now on, and leaving a twin behind is what used to
+  // have the next member paste over content that looked already saved.
+  const draft = liveDraft(room.id);
+  const promotes = text === draft.text;
+  const emptyDraft = () => {
+    if (!promotes) return draft.rev;
+    const rev = draft.rev + 1;
+    db.run("UPDATE rooms SET text = '', rev = ? WHERE id = ?", [rev, room.id]);
+    // No origin: the tab that saved has already moved on to the block, and every
+    // other one is still looking at a draft that no longer holds anything.
+    bus.publish(roomTopic(room.id), { type: "draft", text: "", rev, origin: "" });
+    return rev;
+  };
 
-  // The editor stays on the entry it just created. Leaving it on a loose draft
-  // would mean typing on drifts away from the entry meant to hold it.
-  linkEntry(room.id, pushHistory(room.id, current.text));
-  bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
+  // Saving the same text twice hands back the block that already holds it, so
+  // the caller lands on it either way and the room does not grow a twin.
+  const twin = db
+    .query("SELECT id, rev FROM blocks WHERE room_id = ? AND content = ? LIMIT 1")
+    .get(room.id, text) as { id: number; rev: number } | null;
+  if (twin) {
+    const draftRev = emptyDraft();
+    if (promotes) {
+      broadcastUsage(room.id);
+      touch(room);
+    }
+    return { ok: true, id: twin.id, rev: twin.rev, draftRev };
+  }
+
+  if (!usage.fits(room.id, promotes ? 0 : Buffer.byteLength(text, "utf8"))) {
+    return { ok: false, reason: "full" };
+  }
+
+  const id = insertBlock(room.id, text, member.id, locked);
+  const draftRev = emptyDraft();
+  broadcastBlocks(room.id);
+  broadcastUsage(room.id);
+  touch(room);
+  return { ok: true, id, rev: 0, draftRev };
+}
+
+/** Only the block's author or the room owner: a lock nobody can lift is a bug. */
+const mayGovern = (block: BlockDoc, member: MemberRow) =>
+  block.author_id === member.id || member.role === "owner";
+
+export function lockBlock(
+  room: RoomRow,
+  member: MemberRow,
+  id: number,
+  locked: boolean,
+): "ok" | "gone" | "denied" {
+  const block = blockById(room.id, id);
+  if (!block) return "gone";
+  if (!mayGovern(block, member)) return "denied";
+
+  db.run("UPDATE blocks SET locked = ? WHERE id = ?", [locked ? 1 : 0, id]);
+  broadcastBlocks(room.id);
+  touch(room);
+  return "ok";
+}
+
+export function removeBlock(room: RoomRow, member: MemberRow, id: number): "ok" | "gone" | "denied" {
+  const block = blockById(room.id, id);
+  if (!block) return "gone";
+  // Deleting a locked block would undo the lock the long way round.
+  if (block.locked === 1 && !mayGovern(block, member)) return "denied";
+
+  db.run("DELETE FROM blocks WHERE id = ?", [id]);
+  broadcastBlocks(room.id);
   broadcastUsage(room.id);
   touch(room);
   return "ok";
 }
 
-export function removeEntry(room: RoomRow, id: number): boolean {
-  const result = db.run("DELETE FROM history WHERE room_id = ? AND id = ?", [room.id, id]);
-  if (result.changes === 0) return false;
-  // Deleting the open entry leaves its text in the editor as an unsaved draft,
-  // which beats emptying the editor out from under whoever was typing.
-  if (liveText(room.id).editing_id === id) linkEntry(room.id, null);
-  bus.publish(roomTopic(room.id), { type: "history", items: historyOf(room.id) });
-  broadcastUsage(room.id);
-  touch(room);
-  return true;
-}
-
 /** The only immediate and irreversible deletion: the emergency exit. */
 export function clearRoom(room: RoomRow, origin: string): number {
-  const current = db.query("SELECT text, rev FROM rooms WHERE id = ?").get(room.id) as {
-    text: string;
-    rev: number;
-  };
+  const current = liveDraft(room.id);
   const rev = current.rev + 1;
-  db.run("UPDATE rooms SET text = '', rev = ?, editing_id = NULL WHERE id = ?", [rev, room.id]);
-  db.run("DELETE FROM history WHERE room_id = ?", [room.id]);
+  db.run("UPDATE rooms SET text = '', rev = ? WHERE id = ?", [rev, room.id]);
+  db.run("DELETE FROM blocks WHERE room_id = ?", [room.id]);
 
-  bus.publish(roomTopic(room.id), { type: "text", text: "", rev, origin });
-  bus.publish(roomTopic(room.id), { type: "editing", id: null });
-  bus.publish(roomTopic(room.id), { type: "history", items: [] });
+  bus.publish(roomTopic(room.id), { type: "draft", text: "", rev, origin });
+  bus.publish(roomTopic(room.id), { type: "blocks", items: [] });
   broadcastUsage(room.id);
   touch(room);
   return rev;
@@ -605,22 +676,26 @@ export function clearRoom(room: RoomRow, origin: string): number {
 
 // ── client snapshot ──────────────────────────────────────────────────────────
 
-export function snapshot(room: RoomRow, member: MemberRow) {
+/**
+ * `openId` is the device's own: it says which block that tab is looking at so
+ * the reconnect comes back with its body, and nothing about it is stored.
+ */
+export function snapshot(room: RoomRow, member: MemberRow, openId: number | null) {
   const fresh = db.query("SELECT * FROM rooms WHERE id = ?").get(room.id) as RoomRow;
+  const open = openId === null ? null : blockById(room.id, openId);
   return {
     code: fresh.code,
     role: member.role,
     memberId: member.id,
     fingerprint: member.fingerprint,
-    text: fresh.text,
-    rev: fresh.rev,
-    editingId: fresh.editing_id,
+    draft: { text: fresh.text, rev: fresh.rev },
+    open: open && { id: open.id, text: open.content, rev: open.rev, locked: open.locked === 1 },
     createdAt: fresh.created_at,
     lastActivity: fresh.last_activity,
     expiresAt: expiresAt(fresh),
     autoApproveUntil: fresh.auto_approve_until,
     members: roster(room.id),
-    history: historyOf(room.id),
+    blocks: blocksOf(room.id),
     files: files.listFiles(room.id),
     usage: usage.roomUsage(room.id),
     pending:

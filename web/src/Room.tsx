@@ -3,15 +3,16 @@ import * as api from "./api.ts";
 import {
   ApiError,
   CLIENT_ID,
+  type BlockItem,
+  type Doc,
   type FileItem,
-  type HistoryItem,
   type Member,
   type PendingRequest,
   type Snapshot,
   type Usage,
 } from "./api.ts";
 import { connect, type ConnectionStatus, type ServerEvent } from "./transport.ts";
-import { clearsOnPin, renameCode, saveClearsOnPin, saveStackWidth, savedStackWidth } from "./store.ts";
+import { renameCode, saveStackWidth, savedStackWidth } from "./store.ts";
 import { sendFile } from "./uploads.ts";
 import { Logo } from "./Logo.tsx";
 import { Icon } from "./icons.tsx";
@@ -56,27 +57,47 @@ const FORMATS = [
   { command: "insertOrderedList", key: "numbers", label: "1." },
 ] as const;
 
+/** Matches BLOCK_PREVIEW_CHARS on the server, so a live edit redraws the card. */
+const PREVIEW_CHARS = 400;
+
+const byteLength = (text: string) => new Blob([text]).size;
+
 type State = {
   ready: boolean;
   code: string;
   role: "owner" | "member";
   memberId: string;
+  /**
+   * The block this tab is looking at, or null for the shared draft. It lives
+   * here and nowhere else: another device opening its own block is none of this
+   * one's business, which is the whole point of the split.
+   */
+  openId: number | null;
+  /** The open block refuses writes, so the editor stops taking them too. */
+  locked: boolean;
+  /** The open document as the server has it — the draft or the block. */
   serverText: string;
   serverRev: number;
-  draft: string;
+  text: string;
   /**
-   * Counts the drafts that did not come from the editor. Typing outruns the
+   * Counts the texts that did not come from the editor. Typing outruns the
    * render, so the effect cannot tell an echo from a remote change by comparing
    * text — it would repaint stale text over what is being typed and drop the
    * caret with it. Only a bump here repaints.
    */
   repaint: number;
-  /** The history entry the editor is writing into, or null for a loose draft. */
-  editingId: number | null;
+  /**
+   * The shared draft while a block is open: kept up to date so going back to it
+   * is instant, and so a deleted block has somewhere to land.
+   */
+  shadow: Doc;
   conflict: { text: string; rev: number } | null;
   members: Member[];
   pending: PendingRequest[];
-  history: HistoryItem[];
+  blocks: BlockItem[];
+  /** Changed elsewhere while this tab was looking at something else. */
+  unseen: Set<number>;
+  unseenFiles: Set<string>;
   files: FileItem[];
   usage: Usage;
   expiresAt: number;
@@ -87,12 +108,15 @@ type State = {
 
 type Action =
   | { type: "snapshot"; snap: Snapshot }
-  /** `external` marks a draft the editor has to be repainted with. */
-  | { type: "draft"; text: string; external?: boolean }
+  /** `external` marks text the editor has to be repainted with. */
+  | { type: "edit"; text: string; external?: boolean }
+  | { type: "open"; id: number | null; text: string; rev: number; locked: boolean }
+  | { type: "shadow"; doc: Doc }
   | { type: "commit"; text: string; rev: number }
   | { type: "conflict"; text: string; rev: number }
   | { type: "takeTheirs" }
   | { type: "dropConflict" }
+  | { type: "seenFiles" }
   | { type: "status"; status: ConnectionStatus }
   | { type: "event"; event: ServerEvent };
 
@@ -101,15 +125,19 @@ const initial: State = {
   code: "",
   role: "member",
   memberId: "",
+  openId: null,
+  locked: false,
   serverText: "",
   serverRev: 0,
-  draft: "",
+  text: "",
   repaint: 0,
-  editingId: null,
+  shadow: { text: "", rev: 0 },
   conflict: null,
   members: [],
   pending: [],
-  history: [],
+  blocks: [],
+  unseen: new Set(),
+  unseenFiles: new Set(),
   files: [],
   usage: { used: 0, limit: 0 },
   expiresAt: 0,
@@ -118,7 +146,29 @@ const initial: State = {
   renewedAt: 0,
 };
 
-const isDirty = (s: State) => s.draft !== s.serverText;
+const isDirty = (s: State) => s.text !== s.serverText;
+
+/** Landing on a document: the editor is repainted and the conflict is moot. */
+const land = (state: State, id: number | null, text: string, rev: number, locked: boolean): State => ({
+  ...state,
+  openId: id,
+  locked,
+  serverText: text,
+  serverRev: rev,
+  text,
+  repaint: state.repaint + 1,
+  conflict: null,
+  unseen: without(state.unseen, id),
+  // On the draft the shadow is the same document, so it can never go stale.
+  shadow: id === null ? { text, rev } : state.shadow,
+});
+
+function without<T>(set: Set<T>, value: T | null): Set<T> {
+  if (value === null || !set.has(value)) return set;
+  const next = new Set(set);
+  next.delete(value);
+  return next;
+}
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -130,38 +180,43 @@ function reducer(state: State, action: Action): State {
         code: snap.code,
         role: snap.role,
         memberId: snap.memberId,
-        editingId: snap.editingId,
         members: snap.members,
         pending: snap.pending,
-        history: snap.history,
+        blocks: snap.blocks,
         files: snap.files,
         usage: snap.usage,
+        shadow: snap.draft,
         expiresAt: snap.expiresAt,
         autoApproveUntil: snap.autoApproveUntil,
       };
+      // The block this tab asked for may have been deleted while it was away;
+      // the draft is where it falls back to.
+      const doc = snap.open ?? { id: null, ...snap.draft, locked: false };
       // Re-syncing after a reconnect must not overwrite what the user typed
       // while the connection was down.
-      if (state.ready && isDirty(state) && snap.text !== state.serverText) {
-        return { ...base, conflict: { text: snap.text, rev: snap.rev } };
+      if (state.ready && isDirty(state) && doc.text !== state.serverText) {
+        return { ...base, conflict: { text: doc.text, rev: doc.rev } };
       }
-      return {
-        ...base,
-        serverText: snap.text,
-        serverRev: snap.rev,
-        draft: snap.text,
-        repaint: state.repaint + 1,
-      };
+      return land(base, doc.id, doc.text, doc.rev, doc.locked);
     }
 
-    case "draft":
+    case "edit":
       return {
         ...state,
-        draft: action.text,
+        text: action.text,
         repaint: action.external ? state.repaint + 1 : state.repaint,
       };
 
-    case "commit":
-      return { ...state, serverText: action.text, serverRev: action.rev };
+    case "open":
+      return land(state, action.id, action.text, action.rev, action.locked);
+
+    case "shadow":
+      return { ...state, shadow: action.doc };
+
+    case "commit": {
+      const doc = { text: action.text, rev: action.rev };
+      return { ...state, serverText: doc.text, serverRev: doc.rev, ...(state.openId === null ? { shadow: doc } : {}) };
+    }
 
     case "conflict":
       return { ...state, conflict: { text: action.text, rev: action.rev } };
@@ -172,7 +227,7 @@ function reducer(state: State, action: Action): State {
             ...state,
             serverText: state.conflict.text,
             serverRev: state.conflict.rev,
-            draft: state.conflict.text,
+            text: state.conflict.text,
             repaint: state.repaint + 1,
             conflict: null,
           }
@@ -181,35 +236,81 @@ function reducer(state: State, action: Action): State {
     case "dropConflict":
       return { ...state, conflict: null };
 
+    case "seenFiles":
+      return state.unseenFiles.size === 0 ? state : { ...state, unseenFiles: new Set() };
+
     case "status":
       return { ...state, status: action.status };
 
     case "event": {
       const e = action.event;
       switch (e.type) {
-        case "text": {
+        case "draft": {
+          const doc = { text: String(e.text), rev: Number(e.rev) };
+          // A tab reading a block only files the draft away; being dragged onto
+          // it is exactly what the split is there to prevent.
+          if (state.openId !== null) return { ...state, shadow: doc };
+          return { ...syncOpen(state, doc.text, doc.rev, e.origin === CLIENT_ID), shadow: doc };
+        }
+        case "block": {
+          const id = Number(e.id);
           const text = String(e.text);
-          const rev = Number(e.rev);
-          if (e.origin === CLIENT_ID) return { ...state, serverText: text, serverRev: rev };
-          if (isDirty(state)) return { ...state, conflict: { text, rev } };
-          return {
-            ...state,
-            serverText: text,
-            serverRev: rev,
-            draft: text,
-            repaint: state.repaint + 1,
-          };
+          const blocks = state.blocks.map((item) =>
+            item.id === id
+              ? {
+                  ...item,
+                  rev: Number(e.rev),
+                  updatedAt: Number(e.updatedAt),
+                  bytes: byteLength(text),
+                  preview: text.slice(0, PREVIEW_CHARS),
+                }
+              : item,
+          );
+          if (id === state.openId) {
+            return { ...syncOpen(state, text, Number(e.rev), e.origin === CLIENT_ID), blocks };
+          }
+          // Somewhere else in the room something moved. Worth a mark, not worth
+          // stealing the screen for.
+          const unseen = e.origin === CLIENT_ID ? state.unseen : new Set(state.unseen).add(id);
+          return { ...state, blocks, unseen };
+        }
+        case "blocks": {
+          const items = e.items as BlockItem[];
+          const known = new Set(state.blocks.map((item) => item.id));
+          const alive = new Set(items.map((item) => item.id));
+          const unseen = new Set<number>();
+          for (const id of state.unseen) if (alive.has(id)) unseen.add(id);
+          for (const item of items) {
+            if (!state.ready || known.has(item.id) || item.authorId === state.memberId) continue;
+            unseen.add(item.id);
+          }
+          const next = { ...state, blocks: items, unseen };
+          if (state.openId === null) return next;
+          // The open block was deleted by someone else. The draft is the one
+          // document that is always there, so that is where the editor goes.
+          if (!alive.has(state.openId)) {
+            return land(next, null, state.shadow.text, state.shadow.rev, false);
+          }
+          // This list is what carries a lock, so the editor takes its read-only
+          // state from here: otherwise it stays writable and the server 423s.
+          const open = items.find((item) => item.id === state.openId);
+          return open && open.locked !== state.locked ? { ...next, locked: open.locked } : next;
         }
         case "roster":
           return { ...state, members: e.members as Member[] };
         case "pending":
           return { ...state, pending: e.pending as PendingRequest[] };
-        case "history":
-          return { ...state, history: e.items as HistoryItem[] };
-        case "editing":
-          return { ...state, editingId: e.id === null ? null : Number(e.id) };
-        case "files":
-          return { ...state, files: e.items as FileItem[] };
+        case "files": {
+          const items = e.items as FileItem[];
+          const known = new Set(state.files.map((item) => item.id));
+          const alive = new Set(items.map((item) => item.id));
+          const unseenFiles = new Set<string>();
+          for (const id of state.unseenFiles) if (alive.has(id)) unseenFiles.add(id);
+          for (const item of items) {
+            if (!known.has(item.id) && item.authorId !== state.memberId) unseenFiles.add(item.id);
+          }
+          return { ...state, files: items, unseenFiles };
+        }
         case "usage":
           return { ...state, usage: { used: Number(e.used), limit: Number(e.limit) } };
         case "expiry":
@@ -223,6 +324,13 @@ function reducer(state: State, action: Action): State {
       }
     }
   }
+}
+
+/** A write to the document the editor is on, from this tab or from elsewhere. */
+function syncOpen(state: State, text: string, rev: number, mine: boolean): State {
+  if (mine) return { ...state, serverText: text, serverRev: rev };
+  if (isDirty(state)) return { ...state, conflict: { text, rev } };
+  return { ...state, serverText: text, serverRev: rev, text, repaint: state.repaint + 1 };
 }
 
 const STACK_DEFAULT = 420;
@@ -262,7 +370,6 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   const [failed, setFailed] = useState<Record<string, string>>({});
   const [dragging, setDragging] = useState(false);
   const [stackWidth, setStackWidth] = useState(() => clampStack(savedStackWidth() ?? STACK_DEFAULT));
-  const [clearAfterPin, setClearAfterPin] = useState(clearsOnPin);
   const editorRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLInputElement>(null);
   const resizeFrom = useRef<{ x: number; width: number } | null>(null);
@@ -275,10 +382,20 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
 
   const isOwner = state.role === "owner";
   const dirty = isDirty(state);
-  const openEntry = state.history.find((item) => item.id === state.editingId);
+  const openBlock = state.blocks.find((item) => item.id === state.openId);
   const { used, limit } = state.usage;
   const usedPercent = limit > 0 ? (used / limit) * 100 : 0;
   const full = state.ready && limit > 0 && used >= limit;
+  /* Why each editor button is off. A greyed-out button that says nothing leaves
+     the member guessing, and the shortcut behind it looks broken. */
+  const noPin = isEmpty(state.text)
+    ? t.room.pinEmpty
+    : state.openId !== null && !state.locked
+      ? t.room.pinOpen
+      : full
+        ? t.room.fullShort
+        : null;
+  const noNew = state.openId === null && isEmpty(state.text) ? t.room.newEmpty : null;
   const remaining = state.expiresAt - now;
   const expiringSoon = state.ready && remaining < 10 * 60 * 1000;
   const expiringNow = state.ready && remaining < 5 * 60 * 1000;
@@ -289,8 +406,8 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
      prefix of the stored markup, cut mid-tag as often as not; DOMParser closes
      what is dangling and the card shows text. */
   const previews = useMemo(
-    () => new Map(state.history.map((item) => [item.id, toPlain(item.preview)])),
-    [state.history],
+    () => new Map(state.blocks.map((item) => [item.id, toPlain(item.preview)])),
+    [state.blocks],
   );
 
   const notify = (text: string, undo?: () => void) => {
@@ -316,7 +433,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   useEffect(() => {
     const el = editorRef.current;
     if (!el || state.repaint === 0) return;
-    el.innerHTML = sanitize(state.draft);
+    el.innerHTML = sanitize(state.text);
     paintImages();
   }, [state.repaint]);
 
@@ -328,12 +445,18 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
     };
   }, []);
 
+  /* A reconnect has to come back to the same document, and the connection is set
+     up once: the snapshot reads which one through a ref rather than tearing the
+     socket down every time the tab changes blocks. */
+  const openRef = useRef<number | null>(null);
+  openRef.current = state.openId;
+
   useEffect(() => {
     let alive = true;
 
     const load = async () => {
       try {
-        const snap = await api.getState(token);
+        const snap = await api.getState(token, openRef.current);
         if (!alive) return;
         dispatch({ type: "snapshot", snap });
         onCode(snap.code);
@@ -372,15 +495,16 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
 
   // Debounced write: batches keystrokes into one write every 300 ms.
   useEffect(() => {
-    if (!state.ready || state.conflict || !dirty) return;
+    if (!state.ready || state.conflict || state.locked || !dirty) return;
     // A full room refuses anything longer than what it already holds, so writing
     // it out would fail once per keystroke. Shorter still goes: that is the way
     // back under the limit.
-    if (full && state.draft.length > state.serverText.length) return;
-    const pending = state.draft;
+    if (full && state.text.length > state.serverText.length) return;
+    const pending = state.text;
+    const target = state.openId;
     const timer = setTimeout(async () => {
       try {
-        const { rev } = await api.putText(token, pending, state.serverRev);
+        const { rev } = await api.putText(token, target, pending, state.serverRev);
         dispatch({ type: "commit", text: pending, rev });
       } catch (error) {
         if (error instanceof ApiError && error.status === 409) {
@@ -395,7 +519,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
       }
     }, 300);
     return () => clearTimeout(timer);
-  }, [state.draft, state.serverText, state.serverRev, state.conflict, state.ready, full]);
+  }, [state.text, state.serverText, state.serverRev, state.conflict, state.ready, state.locked, full]);
 
   /**
    * The handlers read state that changes without the listener noticing — the
@@ -413,11 +537,11 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
     }
     if (event.key === "s") {
       event.preventDefault();
-      downloadText(toPlain(state.draft), `cloudnt-${state.code}.txt`);
+      downloadText(toPlain(state.text), `cloudnt-${state.code}.txt`);
     }
     if (event.key === "n") {
       event.preventDefault();
-      void pinCurrent();
+      void saveCurrent();
     }
   };
 
@@ -434,76 +558,101 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   }, []);
 
   const handleCopy = async () => {
-    if (await copyText(toPlain(state.draft))) return notify(t.room.copied);
+    if (await copyText(toPlain(state.text))) return notify(t.room.copied);
     const el = editorRef.current;
     if (el) getSelection()?.selectAllChildren(el);
     notify(t.room.noClipboardSelected);
   };
 
-  const applyOpen = (id: number | null, pin: boolean) =>
+  /**
+   * The debounce may still be holding the last keystrokes, and everything that
+   * follows reads the server's copy. Flushing keeps the two in step.
+   */
+  const flush = async () => {
+    if (!dirty || state.locked) return;
+    const { rev } = await api.putText(token, state.openId, state.text, state.serverRev);
+    dispatch({ type: "commit", text: state.text, rev });
+  };
+
+  /**
+   * Moves this device onto a document. Nothing is written and nothing is
+   * announced: the others keep whatever they were reading.
+   */
+  const openBlockDoc = (id: number) =>
     guard(async () => {
-      const { text, rev } = await api.setEditing(token, id, pin);
-      // Own echoes never touch the draft, so the tab that asked for the swap has
-      // to move its own editor.
-      dispatch({ type: "draft", text, external: true });
-      dispatch({ type: "commit", text, rev });
+      await flush();
+      const doc = await api.blockContent(token, id);
+      dispatch({ type: "open", id, ...doc });
+      setTab("text");
+    });
+
+  const openDraft = () =>
+    guard(async () => {
+      await flush();
+      dispatch({ type: "open", id: null, ...state.shadow, locked: false });
       setTab("text");
     });
 
   /**
-   * Loads an entry into the editor, or empties it when id is null. Both replace
-   * whatever is there, so a draft that is not already on the list gets a say
-   * first: the decision travels with the request and is applied in one step.
+   * Saves what the editor holds as a block. Coming from the draft it is a move
+   * rather than a copy — the server empties the draft — and this tab follows the
+   * text onto the block it just made.
    */
-  const openDoc = (id: number | null) => {
-    const apply = (pin: boolean) => void applyOpen(id, pin);
-
-    // With an entry open the text is already saved into it, and an empty editor
-    // has nothing to lose either way.
-    if (state.editingId !== null || isEmpty(state.draft)) return apply(false);
-    setConfirming({
-      title: t.room.unsavedTitle,
-      body: t.room.unsavedBody,
-      label: t.room.saveAndOpen,
-      safe: true,
-      run: () => apply(true),
-      alt: { label: t.room.discardText, run: () => apply(false) },
-    });
-  };
-
-  const pinCurrent = async () => {
-    // With an entry open the text already has a home; pinning would only make a
-    // second copy of it.
-    if (isEmpty(state.draft) || state.editingId !== null) return;
-    if (full) return notify(t.room.fullPin);
+  const saveCurrent = async () => {
+    // The same reason the button carries, said out loud: reached by the shortcut
+    // there is no greyed-out button to look at.
+    if (noPin) return notify(full ? t.room.fullPin : noPin);
+    if (state.locked) return duplicate();
     await guard(async () => {
-      // Pinning takes the server's copy, so the debounced write has to land
-      // first or the entry misses the last keystrokes of a fresh paste.
-      if (dirty) {
-        const { rev } = await api.putText(token, state.draft, state.serverRev);
-        dispatch({ type: "commit", text: state.draft, rev });
-      }
-      await api.pinText(token);
+      await flush();
+      const { id, rev, draftRev } = await api.saveBlock(token, state.text, false);
+      dispatch({ type: "open", id, text: state.text, rev, locked: false });
+      dispatch({ type: "shadow", doc: { text: "", rev: draftRev } });
       setTab("text");
-      // Pinning leaves the editor on the new entry, so clearing is the same swap
-      // as the New button. It skips the unsaved-text question on purpose: the
-      // text was just saved, whatever this tab still believes about the link.
-      if (clearAfterPin) await applyOpen(null, false);
-      notify(clearAfterPin ? t.room.pinnedCleared : t.room.pinned);
+      notify(t.room.pinned);
     });
   };
 
-  const copyEntry = (id: number) =>
+  /**
+   * A locked block cannot be edited, so editing it means taking a copy first.
+   * The copy lands on the draft, where the usual write path takes over.
+   */
+  const duplicate = () =>
     guard(async () => {
-      const { content } = await api.entryContent(token, id);
-      notify((await copyText(toPlain(content))) ? t.room.entryCopied : t.room.noClipboard);
+      const text = state.text;
+      dispatch({ type: "open", id: null, ...state.shadow, locked: false });
+      dispatch({ type: "edit", text, external: true });
+      setTab("text");
+    });
+
+  /**
+   * Puts the editor back to a blank page. Whatever the draft held is saved as a
+   * block on the way out, so clearing never costs anyone their text.
+   */
+  const startNew = () =>
+    guard(async () => {
+      await flush();
+      const held = state.openId === null ? state.text : state.shadow.text;
+      if (isEmpty(held)) {
+        dispatch({ type: "open", id: null, ...state.shadow, locked: false });
+      } else {
+        const { draftRev } = await api.saveBlock(token, held, false);
+        dispatch({ type: "open", id: null, text: "", rev: draftRev, locked: false });
+      }
+      setTab("text");
+    });
+
+  const copyBlock = (id: number) =>
+    guard(async () => {
+      const { text } = await api.blockContent(token, id);
+      notify((await copyText(toPlain(text))) ? t.room.blockCopied : t.room.noClipboard);
     });
 
   /** The old single-buffer behaviour, kept as one deliberate action. */
   const copyAll = () =>
     guard(async () => {
-      const bodies = await Promise.all(state.history.map((item) => api.entryContent(token, item.id)));
-      const all = [state.draft, ...bodies.map((body) => body.content)]
+      const bodies = await Promise.all(state.blocks.map((item) => api.blockContent(token, item.id)));
+      const all = [state.text, ...bodies.map((body) => body.text)]
         .map(toPlain)
         .filter((text) => text !== "")
         .join("\n\n");
@@ -513,8 +662,8 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   const keepMine = async () => {
     if (!state.conflict) return;
     try {
-      const { rev } = await api.putText(token, state.draft, state.conflict.rev, true);
-      dispatch({ type: "commit", text: state.draft, rev });
+      const { rev } = await api.putText(token, state.openId, state.text, state.conflict.rev, true);
+      dispatch({ type: "commit", text: state.text, rev });
       dispatch({ type: "dropConflict" });
     } catch (error) {
       if (error instanceof ApiError) notify(error.message);
@@ -606,7 +755,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
   const commitEditor = () => {
     const el = editorRef.current;
     if (!el) return;
-    dispatch({ type: "draft", text: serialize(el) });
+    dispatch({ type: "edit", text: serialize(el) });
     paintImages();
   };
 
@@ -679,9 +828,9 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
           <button
             type="button"
             class="btn btn-secondary btn-sm"
-            data-tip={t.room.newTip}
-            disabled={state.editingId === null && isEmpty(state.draft)}
-            onClick={() => openDoc(null)}
+            data-tip={noNew ?? t.room.newTip}
+            disabled={noNew !== null}
+            onClick={() => void startNew()}
           >
             <Icon name="plus" />
             <span class="btn-label">{t.room.new}</span>
@@ -698,18 +847,18 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
           <button
             type="button"
             class="btn btn-secondary btn-sm"
-            data-tip={t.room.pinTip}
-            disabled={isEmpty(state.draft) || full || state.editingId !== null}
-            onClick={() => void pinCurrent()}
+            data-tip={noPin ?? (state.locked ? t.room.duplicateTip : t.room.pinTip)}
+            disabled={noPin !== null}
+            onClick={() => void saveCurrent()}
           >
-            <Icon name="pin" />
-            <span class="btn-label">{t.room.pin}</span>
+            <Icon name={state.locked ? "copy" : "pin"} />
+            <span class="btn-label">{state.locked ? t.room.duplicate : t.room.pin}</span>
           </button>
           <button
             type="button"
             class="btn btn-secondary btn-sm"
             data-tip={t.room.downloadTip}
-            onClick={() => downloadText(toPlain(state.draft), `cloudnt-${state.code}.txt`)}
+            onClick={() => downloadText(toPlain(state.text), `cloudnt-${state.code}.txt`)}
           >
             <Icon name="download" />
             <span class="btn-label">{t.room.download}</span>
@@ -799,20 +948,6 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
               {t.room.language}
               <span class="tag">{t.langName}</span>
             </button>
-            <button
-              type="button"
-              class="menu-item menu-item-toggle"
-              role="menuitemcheckbox"
-              aria-checked={clearAfterPin}
-              onClick={() => {
-                const next = !clearAfterPin;
-                setClearAfterPin(next);
-                saveClearsOnPin(next);
-              }}
-            >
-              {t.room.clearOnPin}
-              <span class="tag">{clearAfterPin ? t.room.yes : t.room.no}</span>
-            </button>
           </div>
 
           {isOwner ? (
@@ -861,10 +996,9 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
                       run: () =>
                         void guard(async () => {
                           const { rev } = await api.clearRoom(token);
-                          // Own echo does not update the draft, to avoid overwriting ongoing
-                          // typing. Clearing is the exception: the editor must end up empty.
-                          dispatch({ type: "draft", text: "", external: true });
-                          dispatch({ type: "commit", text: "", rev });
+                          // Own echo does not repaint, to avoid overwriting ongoing typing.
+                          // Wiping is the exception: the editor must end up empty.
+                          dispatch({ type: "open", id: null, text: "", rev, locked: false });
                           notify(t.room.wiped);
                         }),
                     })
@@ -970,17 +1104,18 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
 
             <span class="room-bar-spacer" />
 
-            {/* Which document the editor holds, so that typing into a paste from
-                the list is never a surprise. */}
-            {openEntry ? (
-              <span class="doc doc-entry">
-                <Icon name="pin" />
-                {t.room.editingEntry(formatAge(openEntry.created_at))}
+            {/* Which document this device holds. Another one may be on a
+                different block, and only this chip says which is which. */}
+            {openBlock ? (
+              <span class="doc doc-block">
+                <Icon name={state.locked ? "lock" : "pin"} />
+                {t.room.editingBlock(formatAge(openBlock.createdAt))}
+                {state.locked ? <span class="tag">{t.room.lockedBlock}</span> : null}
                 <button
                   type="button"
                   class="icon-btn"
-                  title={t.room.closeEntry}
-                  onClick={() => openDoc(null)}
+                  title={t.room.closeBlock}
+                  onClick={() => void openDraft()}
                 >
                   <Icon name="close" />
                 </button>
@@ -992,13 +1127,14 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
           <div
             ref={editorRef}
             class="editor"
-            contentEditable
+            contentEditable={!state.locked}
             role="textbox"
             aria-multiline="true"
+            aria-readonly={state.locked}
             spellcheck={false}
             aria-label={t.room.editorLabel}
             data-placeholder={t.room.editorPlaceholder}
-            data-empty={isEmpty(state.draft) ? "" : undefined}
+            data-empty={isEmpty(state.text) ? "" : undefined}
             onInput={commitEditor}
           />
         </div>
@@ -1044,18 +1180,28 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
               class={`tab${tab === "text" ? " active" : ""}`}
               onClick={() => setTab("text")}
             >
-              {t.room.tabPastes}
-              <span class="tab-n">{state.history.length}</span>
+              {t.room.tabBlocks}
+              <span class="tab-n">{state.blocks.length}</span>
+              {/* Something landed while this tab was on the other one. */}
+              {tab !== "text" && state.unseen.size > 0 ? (
+                <span class="fresh-dot" title={t.room.newTag} />
+              ) : null}
             </button>
             <button
               type="button"
               role="tab"
               aria-selected={tab === "files"}
               class={`tab${tab === "files" ? " active" : ""}`}
-              onClick={() => setTab("files")}
+              onClick={() => {
+                setTab("files");
+                dispatch({ type: "seenFiles" });
+              }}
             >
               {t.room.tabFiles}
               <span class="tab-n">{state.files.length}</span>
+              {tab !== "files" && state.unseenFiles.size > 0 ? (
+                <span class="fresh-dot" title={t.room.newTag} />
+              ) : null}
             </button>
           </div>
 
@@ -1093,46 +1239,69 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
 
           <div class="stack-body">
             {tab === "text" ? (
-              state.history.length === 0 ? (
-                <p class="empty">{t.room.emptyPastes}</p>
+              state.blocks.length === 0 ? (
+                <p class="empty">{t.room.emptyBlocks}</p>
               ) : (
-                state.history.map((item) => (
-                  <article key={item.id} class={`entry${item.id === state.editingId ? " open" : ""}`}>
-                    <pre class="entry-preview">{previews.get(item.id)}</pre>
-                    <div class="entry-foot">
-                      <span class="entry-meta">
-                        {item.id === state.editingId ? `${t.room.openTag} · ` : ""}
-                        {formatSize(item.bytes)} · {formatAge(item.created_at)}
-                      </span>
-                      <span class="room-bar-spacer" />
-                      <button
-                        type="button"
-                        class="icon-btn"
-                        title={t.room.copyEntry}
-                        onClick={() => void copyEntry(item.id)}
-                      >
-                        <Icon name="copy" />
-                      </button>
-                      <button
-                        type="button"
-                        class="icon-btn"
-                        title={t.room.openEntry}
-                        disabled={item.id === state.editingId}
-                        onClick={() => openDoc(item.id)}
-                      >
-                        <Icon name="history" />
-                      </button>
-                      <button
-                        type="button"
-                        class="icon-btn"
-                        title={t.room.removeEntry}
-                        onClick={() => void guard(() => api.removeEntry(token, item.id))}
-                      >
-                        <Icon name="trash" />
-                      </button>
-                    </div>
-                  </article>
-                ))
+                state.blocks.map((item) => {
+                  const open = item.id === state.openId;
+                  const fresh = state.unseen.has(item.id);
+                  const mine = item.authorId === state.memberId || isOwner;
+                  return (
+                    <article
+                      key={item.id}
+                      class={`entry${open ? " open" : ""}${fresh ? " fresh" : ""}`}
+                    >
+                      <pre class="entry-preview">{previews.get(item.id)}</pre>
+                      <div class="entry-foot">
+                        <span class="entry-meta">
+                          {open ? `${t.room.openTag} · ` : ""}
+                          {formatSize(item.bytes)} · {formatAge(item.createdAt)}
+                        </span>
+                        {fresh ? <span class="fresh-dot" title={t.room.newTag} /> : null}
+                        <span class="room-bar-spacer" />
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          title={t.room.copyBlock}
+                          onClick={() => void copyBlock(item.id)}
+                        >
+                          <Icon name="copy" />
+                        </button>
+                        {mine || item.locked ? (
+                          <button
+                            type="button"
+                            class={`icon-btn${item.locked ? " on" : ""}`}
+                            title={item.locked ? t.room.unlockBlock : t.room.lockBlock}
+                            disabled={!mine}
+                            onClick={() =>
+                              void guard(() => api.lockBlock(token, item.id, !item.locked))
+                            }
+                          >
+                            <Icon name={item.locked ? "lock" : "unlock"} />
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          title={t.room.openBlock}
+                          disabled={open}
+                          onClick={() => void openBlockDoc(item.id)}
+                        >
+                          <Icon name="history" />
+                        </button>
+                        <button
+                          type="button"
+                          class="icon-btn"
+                          title={t.room.removeBlock}
+                          disabled={item.locked && !mine}
+                          onClick={() => void guard(() => api.removeBlock(token, item.id))}
+                        >
+                          <Icon name="trash" />
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })
               )
             ) : state.files.length === 0 ? (
               <p class="empty">{t.room.emptyFiles}</p>
@@ -1142,7 +1311,10 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
                 const error = failed[item.id];
                 const ready = item.status === "ready";
                 return (
-                  <article key={item.id} class="entry">
+                  <article
+                    key={item.id}
+                    class={`entry${state.unseenFiles.has(item.id) ? " fresh" : ""}`}
+                  >
                     <div class="file-main">
                       <span class="file-name" title={item.name}>
                         {item.name}
@@ -1230,7 +1402,7 @@ export function Room({ token, onExit, onHome, onCode }: Props) {
         </span>
 
         <span>
-          {formatBytes(state.draft)} ·{" "}
+          {formatBytes(state.text)} ·{" "}
           <span class={dirty ? "foot-dirty" : undefined}>{dirty ? t.room.unsaved : t.room.synced}</span>
         </span>
 

@@ -60,8 +60,8 @@ export const DOWNLOAD_TICKET_TTL_MS = 30 * 1000;
  */
 export const DISK_BYTES = Number(Bun.env.CLOUDNT_DISK_BYTES ?? 20 * 1024 * 1024 * 1024);
 
-/** Matches what the entry card shows, so the wire never carries more than is read. */
-export const HISTORY_PREVIEW_CHARS = 400;
+/** Matches what the block card shows, so the wire never carries more than is read. */
+export const BLOCK_PREVIEW_CHARS = 400;
 
 export const LIMITS = {
   roomsPerIpPerHour: 10,
@@ -76,5 +76,12 @@ export const LIMITS = {
    */
   storageBytesPerRoom: 1024 * 1024 * 1024,
   bytesPerRoom: 5 * 1024 * 1024 * 1024,
-  filesPerRoom: 20,
+  /**
+   * Not a product limit — the room sells one gigabyte and nothing else — but the
+   * budget alone does not bound the *count*: a one-byte file costs nothing of it
+   * and still costs a row, an inode and a directory entry. This and the rate
+   * below are what stop a member from turning a room into a million empty files.
+   */
+  filesPerRoom: 100,
+  filesPerMemberPer5Min: 60,
 };

@@ -332,6 +332,12 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
     if (typeof body.name !== "string" || typeof body.size !== "number") {
       return fail(400, M.badRequest);
     }
+    // Announcing a file is cheap and the storage budget does not price the small
+    // ones, so the count is what has to be paced. Keyed by member: the limit is
+    // on the one doing it, not on everyone sharing an office address.
+    if (!take(`file:${member.id}`, LIMITS.filesPerMemberPer5Min, 5 * 60 * 1000)) {
+      return fail(429, M.tooFastFiles);
+    }
     const result = await files.createFile(room.id, member.id, body.name, body.size);
     if (!result.ok) {
       if (result.reason === "too_many") return fail(409, M.tooManyFiles);
@@ -346,10 +352,11 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
     return json({ id: file.id, name: file.name, chunkSize: file.chunk_size, chunks: file.chunks, received: [] });
   }
 
-  const entryMatch = path.match(/^\/api\/entry\/(\d+)$/);
-  if (entryMatch && req.method === "GET") {
-    const content = rooms.historyContent(room.id, Number(entryMatch[1]));
-    return content === null ? fail(404, M.notFound) : json({ content });
+  const blockMatch = path.match(/^\/api\/block\/(\d+)$/);
+  if (blockMatch && req.method === "GET") {
+    const block = rooms.blockById(room.id, Number(blockMatch[1]));
+    if (!block) return fail(404, M.notFound);
+    return json({ text: block.content, rev: block.rev, locked: block.locked === 1 });
   }
 
   const fileMatch = path.match(/^\/api\/file\/([^/]+)(\/.*)?$/);
@@ -413,37 +420,58 @@ async function api(req: Request, url: URL, path: string, ip: string): Promise<Re
   const origin = req.headers.get("x-client") || member.id;
 
   switch (path) {
-    case "/api/state":
-      return json(rooms.snapshot(room, member));
+    case "/api/state": {
+      // Which block the tab has open is the tab's own, so it has to say so on
+      // every reconnect; the server keeps nothing about it.
+      const open = url.searchParams.get("open");
+      return json(rooms.snapshot(room, member, open === null ? null : Number(open)));
+    }
 
     case "/api/text": {
       if (typeof body.text !== "string" || typeof body.baseRev !== "number") {
         return fail(400, M.badRequest);
       }
-      const result = rooms.setText(room, body.text, body.baseRev, origin, body.force === true);
+      if (body.blockId !== null && typeof body.blockId !== "number") return fail(400, M.badRequest);
+      const result = rooms.write(
+        room,
+        member,
+        body.blockId,
+        body.text,
+        body.baseRev,
+        origin,
+        body.force === true,
+      );
       if (result.ok) return json({ rev: result.rev });
       if (result.reason === "conflict") {
         return json({ error: "conflict", text: result.text, rev: result.rev }, 409);
       }
+      if (result.reason === "gone") return fail(404, M.blockGone);
+      if (result.reason === "locked") return fail(423, M.blockLocked);
       return fail(413, result.reason === "full" ? M.full : M.textTooBig);
     }
 
-    case "/api/pin": {
-      const result = rooms.pinText(room);
-      if (result === "full") return fail(413, M.full);
-      return result === "ok" ? json({ ok: true }) : fail(409, M.nothingToPin);
+    case "/api/block": {
+      if (typeof body.text !== "string") return fail(400, M.badRequest);
+      const result = rooms.saveBlock(room, member, body.text, body.locked === true);
+      if (result.ok) return json({ id: result.id, rev: result.rev, draftRev: result.draftRev });
+      if (result.reason === "nothing") return fail(409, M.nothingToSave);
+      return fail(413, result.reason === "full" ? M.full : M.textTooBig);
     }
 
-    case "/api/editing": {
-      if (body.id !== null && typeof body.id !== "number") return fail(400, M.badRequest);
-      const result = rooms.openEntry(room, body.id, body.pin === true, origin);
-      if (result.ok) return json({ text: result.text, rev: result.rev });
-      return result.reason === "full" ? fail(413, M.full) : fail(404, M.notFound);
-    }
-
-    case "/api/entry/remove": {
+    case "/api/block/lock": {
       if (typeof body.id !== "number") return fail(400, M.badRequest);
-      return rooms.removeEntry(room, body.id) ? json({ ok: true }) : fail(404, M.notFound);
+      const result = rooms.lockBlock(room, member, body.id, body.locked === true);
+      if (result === "gone") return fail(404, M.blockGone);
+      if (result === "denied") return fail(403, M.authorLocks);
+      return json({ ok: true });
+    }
+
+    case "/api/block/remove": {
+      if (typeof body.id !== "number") return fail(400, M.badRequest);
+      const result = rooms.removeBlock(room, member, body.id);
+      if (result === "gone") return fail(404, M.blockGone);
+      if (result === "denied") return fail(403, M.authorLocks);
+      return json({ ok: true });
     }
 
     case "/api/clear":

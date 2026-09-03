@@ -2,7 +2,7 @@ import { db } from "./db.ts";
 import { LIMITS } from "./config.ts";
 
 /**
- * One budget for everything a room holds: the live text, the pinned entries and
+ * One budget for everything a room holds: the live draft, the saved blocks and
  * the files. Separate budgets would let a room sit at the file limit and the
  * text limit at once, and the figure shown in the footer has to mean the whole
  * room or it means nothing.
@@ -15,7 +15,7 @@ export function usedBytes(roomId: string): number {
   const row = db
     .query(
       `SELECT COALESCE((SELECT LENGTH(CAST(text AS BLOB)) FROM rooms WHERE id = ?1), 0)
-            + (SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) FROM history WHERE room_id = ?1)
+            + (SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) FROM blocks WHERE room_id = ?1)
             + (SELECT COALESCE(SUM(size), 0) FROM files WHERE room_id = ?1) AS n`,
     )
     .get(roomId) as { n: number };

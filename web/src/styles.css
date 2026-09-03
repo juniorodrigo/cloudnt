@@ -949,6 +949,11 @@ button {
   padding: 10px 16px;
   background: var(--surface-1);
   border-bottom: 1px solid var(--hairline);
+  /* The tooltips are laid out even while transparent, and the ones near the
+     edges stretched the page into a horizontal scrollbar. Sideways they are
+     clipped to the bar, which is the window anyway; downwards they still hang
+     over the editor because the vertical axis stays visible. */
+  overflow: clip visible;
 }
 
 /* Same shell as the code pill it sits next to: on its own it reads as a stray
@@ -1184,7 +1189,7 @@ button {
   font-size: 12px;
   color: var(--ink-muted);
 }
-.doc-entry {
+.doc-block {
   padding-left: 8px;
   color: var(--accent-blue);
   border-radius: 999px;
@@ -1229,6 +1234,12 @@ button {
 }
 .editor:focus {
   outline: none;
+}
+/* A locked block still needs to be selectable to be copied, so it only loses
+   the caret and a little contrast — enough to say "this one is not yours". */
+.editor[aria-readonly="true"] {
+  color: var(--ink-muted);
+  caret-color: transparent;
 }
 /* A contenteditable has no ::placeholder, and :empty is false as soon as the
    browser drops its trailing <br>, hence the explicit empty marker. */
@@ -1491,6 +1502,10 @@ button {
   background: none;
   cursor: default;
 }
+/* A lock that is engaged reads as state, not as a button waiting to be pressed. */
+.icon-btn.on {
+  color: var(--accent-blue);
+}
 .icon-btn .icon {
   width: 16px;
   height: 16px;
@@ -1503,7 +1518,7 @@ button {
   padding: 4px 2px;
 }
 
-/* ── stack: pastes and files, one panel, two tabs ────────────────────────── */
+/* ── stack: blocks and files, one panel, two tabs ────────────────────────── */
 
 .stack {
   display: flex;
@@ -1550,6 +1565,16 @@ button {
   color: var(--ink-muted);
 }
 
+/* Novelty, not an alert: the pending badge is the blue one that asks for an
+   answer, so what arrives on its own gets a green dot and nothing else. */
+.fresh-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--success);
+}
+
 .stack-tools {
   flex: none;
   padding: 10px 12px;
@@ -1578,6 +1603,13 @@ button {
 }
 .entry.open .entry-meta {
   color: var(--accent-blue);
+}
+/* Unread weight: the preview reads as text you have not passed over yet. */
+.entry.fresh .entry-preview {
+  color: var(--ink);
+}
+.entry.fresh .file-name {
+  font-weight: 600;
 }
 
 /* Four lines is enough to recognise a key or a stack trace; the whole point is
@@ -1611,7 +1643,8 @@ button {
   transition: opacity 0.15s ease;
 }
 .entry:hover .entry-foot .icon-btn,
-.entry-foot .icon-btn:focus-visible {
+.entry-foot .icon-btn:focus-visible,
+.entry-foot .icon-btn.on {
   opacity: 1;
 }
 

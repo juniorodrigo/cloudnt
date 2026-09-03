@@ -49,7 +49,7 @@ export function App() {
       const saved = tokenFor(code);
       if (saved) {
         try {
-          const snap = await api.getState(saved);
+          const snap = await api.getState(saved, null);
           return openRoom(snap.code, saved, snap.role);
         } catch {
           forget(saved);

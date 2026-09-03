@@ -286,12 +286,35 @@ confianza del producto y ningún competidor lo muestra:
 
 ## 5. Texto
 
-- Sincronización bidireccional por WebSocket, último-que-escribe-gana
-- **Detección de conflicto**: si ambos lados editan a la vez no se pisa el texto local; aviso con "traer la nueva" / "conservar la mía"
-- **Pegadas**: las últimas 10 de la sala, restaurables con un clic. Se guardan solas cuando un pegado reemplaza al anterior, y a mano con "fijar" para tener dos textos a la vez sin pisar ninguno. No se duplica lo que ya está en la lista. Convierte la app de buffer a portapapeles con memoria; es la función que hace que la gente vuelva
+La sala no tiene un texto, tiene varios documentos: un **borrador compartido**
+—donde empieza todo— y un **bloque** por cada texto guardado. Cada documento
+lleva su propia revisión y se escribe por separado.
+
+- Sincronización bidireccional por WebSocket, último-que-escribe-gana **por documento**
+- **Detección de conflicto**: cada escritura viaja con la revisión sobre la que se editó; si no coincide con la del servidor, éste devuelve su versión y el cliente avisa con "traer la nueva" / "conservar la mía"
+- **Bloques**: sin tope de cantidad, solo el presupuesto de la sala. Se guardan solos cuando un pegado reemplaza al borrador anterior, y a mano con "Guardar", que promociona el borrador a bloque y lo deja vacío. Guardar un texto que ya está en la lista devuelve el bloque que lo tiene en vez de duplicarlo
+- **Solo lectura**: quien crea un bloque puede echarle el candado. Un bloque bloqueado no admite escrituras y solo su autor o el dueño de la sala lo desbloquea o lo borra; los demás pueden copiarlo o duplicarlo al borrador
 - **Resaltado de sintaxis** en modo lectura, con detección de lenguaje
 - **Descargar como archivo**: para bloques grandes suele ser mejor que copiar
 - **Pegado directo al crear sala**: si hay permiso de portapapeles, un botón único de "pegar lo que tengo copiado"
+
+### 5.1 Qué bloque mira cada dispositivo
+
+Qué documento tiene abierto un dispositivo es asunto suyo: el servidor no lo
+guarda. Abrir un bloque en la laptop no arrastra a la VM, que sigue en el suyo;
+dos dispositivos sobre el mismo documento sí se ven escribir en vivo, como
+siempre. El cliente manda el bloque abierto como `?open=` al pedir el snapshot
+—para volver al mismo sitio tras una reconexión— y como `blockId` al escribir.
+
+Un bloque abierto que otro borra devuelve el editor al borrador compartido, el
+único documento que siempre está.
+
+### 5.2 Avisos de novedad
+
+Cuando llega un bloque o un archivo de otro miembro mientras miras otra cosa, la
+tarjeta se marca con un punto verde y la pestaña que la contiene también. No hay
+modal ni toast: se apaga solo al abrir el bloque o al mirar la pestaña. Lo que
+crea uno mismo nunca se marca.
 
 Sin CRDT. Yjs suena bien, pero el caso real es un lado escribiendo y otro
 leyendo; el aviso de conflicto cubre el 99%.
@@ -364,8 +387,7 @@ archivos en memoria. Por eso no se hace.
 
 | Qué | Dónde | Por qué |
 |---|---|---|
-| Texto de sala efímera | Memoria | Kilobytes, latencia baja, va por pub/sub |
-| Texto de sala fijada | `bun:sqlite` | Debe sobrevivir a reinicios |
+| Borrador y bloques | `bun:sqlite` | Kilobytes; una tabla `blocks` con su revisión, su candado y su autor, y el borrador en la propia fila de la sala. Los cambios viajan por pub/sub |
 | Archivos | Disco local, `/var/cloudnt/{sala}/{id}` | Servidos con `Bun.file()` → `sendfile`, sin pasar por RAM |
 | Índice y metadatos | `bun:sqlite` | Sobrevive a reinicios |
 
@@ -414,15 +436,20 @@ aprobación". Cero contenido.
 
 **Sala.** El editor en vivo ocupa el centro, sin cromo propio: es el lienzo. Lo
 enmarcan una barra arriba y un pie abajo, y a la derecha una columna con dos
-pestañas: **Pegadas**, el historial de textos que se puede copiar, traer de
-vuelta al editor o quitar; y **Archivos**, la lista con sus tres estados y la
+pestañas: **Bloques**, los textos guardados que se pueden copiar, abrir en el
+editor, bloquear o quitar; y **Archivos**, la lista con sus tres estados y la
 zona de arrastre. Los archivos no van debajo del editor: comparten columna con
-las pegadas y solo ocupan sitio cuando se piden. La columna arranca en 420 px y
+los bloques y solo ocupan sitio cuando se piden. La columna arranca en 420 px y
 se redimensiona arrastrando el separador; el ancho se recuerda por navegador.
 
+En la esquina de la barra de formato, el editor dice qué documento tiene
+delante: "borrador compartido", o el bloque abierto con su edad, su etiqueta de
+solo lectura si la lleva y una cruz para volver al borrador.
+
 En la **barra**, a la izquierda el código —con la marca como único distintivo,
-porque aquí el código es la etiqueta, no el nombre—; en el centro las tres
-acciones del texto: copiar, nueva pegada, descargar; y a la derecha dos botones
+porque aquí el código es la etiqueta, no el nombre—; en el centro las cuatro
+acciones del texto: nuevo, copiar, guardar —duplicar, si el bloque abierto está
+bloqueado— y descargar; y a la derecha dos botones
 que abren paneles: **dispositivos**, con las solicitudes pendientes y la lista
 con botón de expulsar, y **ajustes**, con el acceso —aprobación automática,
 rotar código— y la zona de riesgo. Vaciar la sala y cerrarla piden confirmación
@@ -453,7 +480,7 @@ El usuario está en una VM donde el mouse va con retraso. Todo debe ser operable
 con teclado: copiar, descargar, saltar entre archivos, aprobar. Aquí la
 accesibilidad es también rendimiento.
 
-En la sala: `Alt+C` copia, `Alt+N` guarda el texto actual como pegada aparte y
+En la sala: `Alt+C` copia, `Alt+N` guarda el texto actual como bloque aparte y
 `Alt+S` lo descarga. Se anuncian en el pie, porque un atajo que no se ve no
 existe. El separador de la columna es un `separator` enfocable que se mueve con
 las flechas.
@@ -505,10 +532,18 @@ Desde el día uno, no después:
 | Salas por IP | 10 / hora |
 | Salas fijadas por IP | 3 |
 | Tamaño por archivo | 1 GB |
-| Almacenamiento por sala | 1 GB (texto, pegadas y archivos juntos) |
+| Almacenamiento por sala | 1 GB (texto, bloques y archivos juntos) |
 | Ancho de banda por sala | 5 GB |
 | Texto por sala | 8 MB |
 | Salas concurrentes | 500 |
+| Archivos por sala | 100 (guarda antiabuso, no se anuncia) |
+| Archivos creados por miembro | 60 / 5 min |
+
+El gigabyte es el único límite que se promete. El número de archivos no se
+anuncia porque no es una promesa: el presupuesto no acota el recuento —un
+archivo de un byte no cuesta casi nada de él y sí cuesta una fila y un inodo—,
+así que el tope y el ritmo están para que nadie convierta una sala en un millón
+de ficheros vacíos.
 
 ---
 
@@ -544,7 +579,7 @@ Cada etapa es entregable por sí sola.
 2. **Aprobación del dueño y huella.** Aquí ya es defendible ponerlo público
 3. **Archivos con subida por trozos y descarga manual**
 4. **Recepción automática** con Service Worker y conteo de referencias
-5. **CLI e historial**
+5. **CLI y bloques**
 6. **SQLite para el índice**, que permite desplegar sin matar sesiones vivas
 7. **Salas fijadas**, que dependen de la etapa 6
 
@@ -587,5 +622,5 @@ resuelve sin tocar la marca.
 - Diccionario de la huella: ¿palabras en español, en inglés, o neutras entre ambos?
 - Frase de recuperación de salas fijadas: ¿4 palabras del mismo diccionario de la huella, o BIP39?
 - Formato del registro de auditoría empresarial: ¿syslog, JSON por línea, webhook?
-- ¿Las salas fijadas conservan el historial de texto completo, o solo el estado actual? Afecta al tamaño de la base y a la promesa de privacidad
+- ¿Las salas fijadas conservan todos los bloques, o solo el borrador actual? Afecta al tamaño de la base y a la promesa de privacidad
 - ¿Se permite fijar una sala que ya tiene miembros aprobados, o solo al crearla? Fijar después cambia retroactivamente lo que los presentes creían que iba a pasar con su contenido

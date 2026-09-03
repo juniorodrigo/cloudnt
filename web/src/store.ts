@@ -7,7 +7,6 @@ export type SavedRoom = {
 
 const KEY = "cloudnt:rooms";
 const WIDTH_KEY = "cloudnt:stack-width";
-const CLEAR_ON_PIN_KEY = "cloudnt:clear-on-pin";
 const LANG_KEY = "cloudnt:lang";
 const MAX = 8;
 
@@ -51,21 +50,6 @@ export function saveStackWidth(width: number): void {
     localStorage.setItem(WIDTH_KEY, String(Math.round(width)));
   } catch {
     // private mode or quota exceeded: the panel just goes back to its default width
-  }
-}
-
-/**
- * Off unless it was turned on: pinning leaves the text in place, which is what
- * someone who pins to keep editing expects. The other habit — pin, then paste
- * the next thing — wants the opposite, so it is a choice rather than a default.
- */
-export const clearsOnPin = (): boolean => localStorage.getItem(CLEAR_ON_PIN_KEY) === "1";
-
-export function saveClearsOnPin(on: boolean): void {
-  try {
-    localStorage.setItem(CLEAR_ON_PIN_KEY, on ? "1" : "0");
-  } catch {
-    // private mode or quota exceeded: the preference just does not outlive the tab
   }
 }
 
